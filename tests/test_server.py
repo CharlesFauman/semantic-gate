@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -72,6 +73,10 @@ class SemanticGateApplicationTests(unittest.TestCase):
         page=self.call("GET","/",{"Cookie":cookie}); text=page.body.decode()
         self.assertIn("Semantic Gate",text); self.assertIn("device.power_off",text); self.assertNotIn("never-render-me",text)
         self.assertIn("Audit",text); self.assertIn("Pause all",text)
+        scripts=re.findall(r"<script>(.*?)</script>",text,flags=re.DOTALL)
+        self.assertEqual(1,len(scripts))
+        self.assertNotIn("filter(Boolean)}else return",scripts[0])
+        self.assertIn("filter(Boolean)}}else return",scripts[0])
         request=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"two"}).json()
         self.assertEqual(403,self.call("POST",f"/admin/requests/{request['request_id']}/approve",{"Cookie":cookie},{}).status)
         headers={"Cookie":cookie,"Origin":"https://control.example","X-CSRF-Token":csrf}
