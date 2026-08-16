@@ -11,6 +11,7 @@ from http import cookies
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
+from . import __version__
 from .auth import AuthError, CapabilityAuthority, Principal
 from .controller import GateControl, GateControlError
 from .credentials import CredentialRegistry
@@ -150,7 +151,7 @@ class SemanticGateApplication:
         request_id=message.get("id"); method=message.get("method"); params=message.get("params",{})
         try:
             if message.get("jsonrpc")!="2.0" or not isinstance(method,str) or not isinstance(params,dict): raise GateControlError("invalid request")
-            if method=="initialize": result={"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":False}},"serverInfo":{"name":"semantic-gate","version":"0.2.0"}}
+            if method=="initialize": result={"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":False}},"serverInfo":{"name":"semantic-gate","version":__version__}}
             elif method=="ping": result={}
             elif method=="tools/list": result={"tools":MCP_TOOLS}
             elif method=="tools/call":

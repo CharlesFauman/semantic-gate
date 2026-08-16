@@ -10,6 +10,23 @@ Every checked-in example is `simulation_only` with execution disabled. Names,
 providers and targets are placeholders. There are no live URLs, credentials or
 environment-specific identifiers.
 
+## Runnable integration flows
+
+- `integrations/buzz_approval_flow.py` — verified-reaction adapter boundary and
+  real step-up approval ingestion; Buzz cryptography is explicitly not bundled;
+- `integrations/existing_mcp_adapter.py` — existing read/effect MCP tools behind
+  the real engine registry;
+- `integrations/multi_step_flow.py` — two separately authorized actions with
+  agent-owned sequencing and branching.
+
+Run them from the repository root:
+
+```sh
+PYTHONPATH=src python examples/integrations/buzz_approval_flow.py
+PYTHONPATH=src python examples/integrations/existing_mcp_adapter.py
+PYTHONPATH=src python examples/integrations/multi_step_flow.py
+```
+
 ## Adapting a private integration
 
 Keep private policy and adapter code in the consuming repository. Use the public
