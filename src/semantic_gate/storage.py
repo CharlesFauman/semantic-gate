@@ -10,10 +10,11 @@ from typing import Any
 
 
 class Ledger:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, max_observations: int = 100_000, max_audit_events: int = 200_000):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self.max_observations=max(1,int(max_observations)); self.max_audit_events=max(1,int(max_audit_events))
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript("""
@@ -35,6 +36,19 @@ class Ledger:
           actor TEXT NOT NULL,
           at INTEGER NOT NULL,
           metadata_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS observations (
+          event_id TEXT NOT NULL,
+          principal TEXT NOT NULL,
+          phase TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          semantic_class TEXT NOT NULL,
+          outcome TEXT NOT NULL,
+          occurred_at INTEGER NOT NULL,
+          received_at INTEGER NOT NULL,
+          metadata_json TEXT NOT NULL,
+          observation_json TEXT NOT NULL,
+          PRIMARY KEY(principal,event_id)
         );
         CREATE TABLE IF NOT EXISTS controls (
           key TEXT PRIMARY KEY,
@@ -70,6 +84,7 @@ class Ledger:
                 "INSERT INTO audit(request_id,event,actor,at,metadata_json) VALUES(?,?,?,?,?)",
                 (request_id, event, actor, at, self._json(metadata or {})),
             )
+            self._prune_audit_locked()
 
     def get_request(self, request_id: str) -> dict | None:
         with self._lock:
@@ -94,6 +109,51 @@ class Ledger:
         with self._lock:
             rows = self._db.execute(query, args).fetchall()
         return [{"seq": row["seq"], "request_id": row["request_id"], "event": row["event"], "actor": row["actor"], "at": row["at"], "metadata": json.loads(row["metadata_json"])} for row in rows]
+
+    def _prune_audit_locked(self):
+        self._db.execute("DELETE FROM audit WHERE seq NOT IN (SELECT seq FROM audit ORDER BY seq DESC LIMIT ?)",(self.max_audit_events,))
+
+    def record_audit(self, *, event: str, actor: str, at: int, metadata: dict, request_id: str | None = None):
+        with self._lock,self._db:
+            self._db.execute(
+                "INSERT INTO audit(request_id,event,actor,at,metadata_json) VALUES(?,?,?,?,?)",
+                (request_id,event,actor,int(at),self._json(metadata)),
+            )
+            self._prune_audit_locked()
+
+    def get_observation(self, event_id: str, *, principal: str) -> dict | None:
+        with self._lock:
+            row=self._db.execute("SELECT observation_json FROM observations WHERE principal=? AND event_id=?",(principal,event_id)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    @staticmethod
+    def _observation_payload(observation: dict) -> dict:
+        return {key:value for key,value in observation.items() if key!="received_at"}
+
+    def record_observation(self, observation: dict) -> dict:
+        encoded=self._json(observation); comparable=self._observation_payload(observation)
+        with self._lock,self._db:
+            row=self._db.execute("SELECT observation_json FROM observations WHERE principal=? AND event_id=?",(observation["principal"],observation["event_id"])).fetchone()
+            if row:
+                existing=json.loads(row[0])
+                if self._observation_payload(existing)!=comparable: raise ValueError("conflicting observation event_id")
+                return existing
+            inserted=self._db.execute(
+                """INSERT OR IGNORE INTO observations(event_id,principal,phase,operation,semantic_class,outcome,occurred_at,received_at,metadata_json,observation_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (observation["event_id"],observation["principal"],observation["phase"],observation["operation"],observation["semantic_class"],observation["outcome"],int(observation["occurred_at"]),int(observation["received_at"]),self._json(observation["metadata"]),encoded),
+            )
+            if inserted.rowcount==0:
+                existing=json.loads(self._db.execute("SELECT observation_json FROM observations WHERE principal=? AND event_id=?",(observation["principal"],observation["event_id"])).fetchone()[0])
+                if self._observation_payload(existing)!=comparable: raise ValueError("conflicting observation event_id")
+                return existing
+            self._db.execute(
+                "INSERT INTO audit(request_id,event,actor,at,metadata_json) VALUES(NULL,?,?,?,?)",
+                ("permission_observed",observation["principal"],int(observation["received_at"]),self._json({key:observation[key] for key in ("event_id","phase","operation","semantic_class","outcome","occurred_at","metadata")})),
+            )
+            self._db.execute("DELETE FROM observations WHERE rowid NOT IN (SELECT rowid FROM observations ORDER BY received_at DESC,rowid DESC LIMIT ?)",(self.max_observations,))
+            self._prune_audit_locked()
+        return dict(observation)
 
     def expire_unresolved(self, *, now: int) -> int:
         terminal = {"blocked", "cancelled", "simulated", "executed", "failed", "expired", "denied"}
@@ -121,6 +181,7 @@ class Ledger:
                 "INSERT INTO audit(request_id,event,actor,at,metadata_json) VALUES(NULL,?,?,?,?)",
                 ("control_changed", actor, int(now), self._json({"key": key, "value": value})),
             )
+            self._prune_audit_locked()
 
     def controls(self) -> dict:
         result = {"pause_all": False, "paused_domains": [], "revoked_principals": []}

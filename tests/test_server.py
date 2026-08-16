@@ -90,5 +90,17 @@ class SemanticGateApplicationTests(unittest.TestCase):
         response=self.app.handle("POST","/api/v1/requests",self.agent,b'{"action":"device.power_off","parameters":{"x":NaN},"context":{},"idempotency_key":"nan"}')
         self.assertEqual(400,response.status)
 
+    def test_authenticated_audit_observation_is_identity_bound_and_not_an_approval_route(self):
+        payload={"event_id":"tool-1:attempted","phase":"attempted","operation":"terminal","semantic_class":"compute.exec.arbitrary","outcome":"started","occurred_at":99,"metadata":{"surface":"hermes"}}
+        self.assertEqual(401,self.call("POST","/api/v1/audit-observations",payload=payload).status)
+        response=self.call("POST","/api/v1/audit-observations",self.agent,payload)
+        self.assertEqual(200,response.status)
+        self.assertEqual("agent",response.json()["principal"])
+        self.assertEqual("permission_observed",self.ledger.audit_events()[-1]["event"])
+        for field,value in (("phase",[]),("outcome",{})):
+            malformed={**payload,field:value,"event_id":f"malformed-{field}"}
+            with self.subTest(field=field): self.assertEqual(400,self.call("POST","/api/v1/audit-observations",self.agent,malformed).status)
+        self.assertEqual(404,self.call("POST","/api/v1/audit-observations/tool-1/approve",self.agent,{}).status)
+
 
 if __name__=="__main__": unittest.main()

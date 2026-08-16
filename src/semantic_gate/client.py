@@ -31,4 +31,6 @@ class SemanticGateClient:
     def get_request(self,request_id: str): return self._call("GET",f"/api/v1/requests/{request_id}")
     def request_action(self,action: str,*,parameters: dict,context: dict,idempotency_key: str):
         return self._call("POST","/api/v1/requests",{"action":action,"parameters":parameters,"context":context,"idempotency_key":idempotency_key})
+    def observe_permission(self,*,event_id: str,phase: str,operation: str,semantic_class: str,outcome: str,occurred_at: int,metadata: dict):
+        return self._call("POST","/api/v1/audit-observations",{"event_id":event_id,"phase":phase,"operation":operation,"semantic_class":semantic_class,"outcome":outcome,"occurred_at":occurred_at,"metadata":metadata})
     def cancel_request(self,request_id: str): return self._call("POST",f"/api/v1/requests/{request_id}/cancel",{})
