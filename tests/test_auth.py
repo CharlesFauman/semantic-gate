@@ -13,6 +13,7 @@ class CapabilityAuthorityTests(unittest.TestCase):
         self.authority = CapabilityAuthority(bytes.fromhex("11" * 32), {
             "hermes-mac": {"role": "agent", "enabled": True},
             "control-panel": {"role": "admin", "enabled": True},
+            "device-audit": {"role": "observer", "enabled": True},
             "revoked-agent": {"role": "agent", "enabled": False},
         })
 
@@ -21,6 +22,8 @@ class CapabilityAuthorityTests(unittest.TestCase):
         principal = self.authority.authenticate_bearer(f"Bearer {token}")
         self.assertEqual("hermes-mac", principal.principal_id)
         self.assertEqual("agent", principal.role)
+        observer=self.authority.authenticate_bearer(f"Bearer {self.authority.token_for('device-audit')}")
+        self.assertEqual("observer",observer.role)
 
     def test_unknown_forged_and_revoked_tokens_fail_closed(self):
         for header in (None, "", "Basic nope", "Bearer forged", f"Bearer {self.authority.token_for('revoked-agent')}"):

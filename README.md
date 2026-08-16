@@ -144,6 +144,10 @@ prompts, arguments, results, commands, file contents and credentials do not
 belong in this endpoint. The default ledger retains at most 100,000 observations
 and 200,000 audit rows; hosts may choose lower bounds. Observation ingestion is
 not approval or evidence that an old direct-capability bypass has been removed.
+For least privilege, hosts can issue a dedicated `observer` principal. Observer
+capabilities can submit observations but receive HTTP 403 from action, request
+and MCP surfaces, and observer principals are excluded from generated action
+policies.
 
 The bundled `RecipePlugin` demonstrates safe local control: fixed executable,
 fixed argument vector and allowlisted parameter values, with no shell. It is

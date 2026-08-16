@@ -41,7 +41,7 @@ class CapabilityAuthority:
         if not config or config.get("enabled") is not True:
             raise AuthError("principal is unavailable")
         role = config.get("role")
-        if role not in {"agent", "admin", "service"}:
+        if role not in {"agent", "admin", "service", "observer"}:
             raise AuthError("principal role is invalid")
         return Principal(principal_id, str(role))
 
