@@ -40,11 +40,23 @@ A production host must:
 - constrain target adapter egress and credentials to least privilege;
 - audit policy and adapter changes.
 
+## Additional v0.2 components
+
+The optional service supplies durable request snapshots, audit metadata,
+proposal-only REST/HTTP MCP, a simulation control panel, capability-derived
+principals and distributed single-use execution leases. These additions do not
+turn the package into an operating-system sandbox or credential vault.
+
+The browser panel requires an exact configured Origin plus a session-bound CSRF
+token for every decision/control mutation. Secure cookies are the default;
+private HTTP deployments must explicitly opt out and rely on a trusted private
+transport until TLS is available. The service applies strict finite/bounded JSON
+validation to HTTP and MCP bodies and emits no CORS policy.
+
 ## What the library does not yet provide
 
-- durable transactional storage;
-- remote HTTP MCP transport;
-- distributed locks;
+- crash-resumable transactional engine state for live execution;
+- distributed consensus or locks across coordinator replicas;
 - built-in identity provider or biometric verification;
 - built-in notification provider;
 - built-in downstream MCP client;
@@ -52,9 +64,20 @@ A production host must:
 - process/container isolation;
 - formal verification of arbitrary adapter code.
 
-The bundled in-memory engine is appropriate for design, tests and single-process
-integration. Do not claim crash-safe exactly-once execution without a durable
-storage adapter and downstream idempotency.
+The bundled engine and coordinator are appropriate for design, tests,
+simulation and single-process integration. The coordinator expires unresolved
+requests after restart. Do not claim crash-safe exactly-once execution without
+durable execution claims, adapter reconciliation and downstream idempotency.
+
+## Deployment status language
+
+- **Catalogued:** an action has schema and policy metadata.
+- **Shadowed:** requests and audit pass through Semantic Gate, but another direct
+  credential/tool/shell path can bypass it.
+- **Enforced:** the agent has no direct downstream credential or raw effectful
+  tool; the only execution path is an isolated broker/plugin.
+
+Never describe a shadowed integration as protected or enforced.
 
 Public JSON boundaries are intentionally bounded: signed 64-bit integers,
 64 KiB strings, 10,000-item collections, depth 64, 100,000 nodes, 256-character

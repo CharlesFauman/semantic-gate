@@ -1,0 +1,16 @@
+{
+  "illustrative_only": true,
+  "lease_id": "example-lease",
+  "request_id": "example-request",
+  "request_hash": "example-request-hash",
+  "action": "desktop.application.open",
+  "node_id": "example-workstation",
+  "plugin_id": "example.reviewed-apps",
+  "parameters": {"application": "example-viewer"},
+  "parameters_hash": "computed-by-coordinator",
+  "policy_hash": "example-policy-hash",
+  "issued_at": 100,
+  "expires_at": 160,
+  "nonce": "example-nonce",
+  "signature": "computed-by-coordinator"
+}

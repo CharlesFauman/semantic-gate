@@ -9,10 +9,13 @@ last-moment rechecks before the target tool can run.
 
 It is agent-framework and tool-provider agnostic. A target adapter can wrap an
 API, local function, command broker, another MCP server, or any other host-owned
-capability.
+capability. The optional coordinator service, direct HTTP client, mobile control
+panel and distributed node-broker/plugin SDK use the same semantic action model.
 
 > **Status:** alpha. All bundled examples are simulation-only. The default MCP
 > server installs a deny-all approval verifier and no execution authority.
+> The coordinator added in v0.2 also generates simulation-only policy and expires
+> unresolved requests on restart; it does not claim crash-safe live execution.
 
 ## Why
 
@@ -116,6 +119,31 @@ There is deliberately no MCP tool for approval ingestion or execution.
 ```
 
 See [`examples/`](examples/) for calendar, purchase and device-control flows.
+
+## Coordinator, SDK and distributed brokers
+
+`semantic-gate-server` runs a dependency-free HTTP coordinator with:
+
+- proposal/status/cancellation REST endpoints;
+- proposal-only MCP over HTTP;
+- a mobile control panel for simulation review;
+- SQLite request snapshots, audit events and emergency controls;
+- host-derived principal capabilities;
+- redacted credential-binding inventory.
+
+`SemanticGateClient` provides the same proposal contract without MCP. Local and
+remote execution plugins implement `ActionPlugin` and run behind `NodeBroker`.
+The broker accepts only signed, expiring, single-use leases addressed to an exact
+node, plugin, semantic action and canonical parameter hash.
+
+The bundled `RecipePlugin` demonstrates safe local control: fixed executable,
+fixed argument vector and allowlisted parameter values, with no shell. It is
+appropriate for reviewed native helpers or checked-in automation recipes, not
+arbitrary script text or GUI coordinates. Recipe subprocesses receive a minimal
+fixed environment rather than inheriting coordinator or broker credentials.
+
+See [`docs/PLUGINS.md`](docs/PLUGINS.md) and
+[`docs/DESIGN_RESEARCH.md`](docs/DESIGN_RESEARCH.md).
 
 ## Embedding with arbitrary tools
 
