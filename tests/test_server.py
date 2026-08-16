@@ -54,8 +54,15 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertEqual("/login",redirect.headers["Location"])
         page=self.call("GET","/login")
         self.assertEqual(200,page.status)
-        self.assertIn("Semantic Gate",page.body.decode())
-        self.assertIn("password",page.body.decode().casefold())
+        text=page.body.decode()
+        self.assertIn("Semantic Gate",text)
+        self.assertIn('name=username',text)
+        self.assertIn('autocomplete=username',text)
+        self.assertIn('value=charles',text)
+        self.assertIn('name=password',text)
+        self.assertIn('autocomplete=current-password',text)
+        self.assertIn('method=post',text)
+        self.assertIn('action=/login',text)
 
     def test_control_panel_login_csrf_approval_and_secret_redaction(self):
         self.assertEqual(403,self.call("POST","/login",payload={"password":"wrong"}).status)
