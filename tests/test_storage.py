@@ -36,16 +36,40 @@ class LedgerTests(unittest.TestCase):
         for state in ("processing", "waiting_for_approval"):
             self.ledger.record_request({"request_id":f"req_{state}","action":"x.y","requester":"agent","state":state,"created_at":100}, event="requested", actor="agent")
         self.ledger.record_request({"request_id":"req_done","action":"x.y","requester":"agent","state":"simulated","created_at":100}, event="simulated", actor="system")
+        self.ledger.record_request({"request_id":"req_authorized","action":"x.y","requester":"agent","state":"authorized","created_at":100,"authorization":{"authorization_id":"auth_one"}}, event="authorized", actor="human")
+        for state in ("consuming","outcome_unknown"):
+            self.ledger.record_request({"request_id":f"req_{state}","action":"x.y","requester":"agent","state":state,"created_at":100,"authorization":{"authorization_id":"auth_"+state}},event=state,actor="authorization-store")
         expired = self.ledger.expire_unresolved(now=200)
         self.assertEqual(2, expired)
         self.assertEqual("expired", self.ledger.get_request("req_processing")["state"])
         self.assertEqual("simulated", self.ledger.get_request("req_done")["state"])
+        self.assertEqual("authorized", self.ledger.get_request("req_authorized")["state"])
+        self.assertEqual("consuming",self.ledger.get_request("req_consuming")["state"])
+        self.assertEqual("outcome_unknown",self.ledger.get_request("req_outcome_unknown")["state"])
 
     def test_restart_expiration_covers_more_than_one_page(self):
         for index in range(750):
             self.ledger.record_request({"request_id":f"bulk_{index:04d}","action":"x.y","requester":"agent","state":"waiting_for_approval","created_at":index},event="requested",actor="agent")
         self.assertEqual(750,self.ledger.expire_unresolved(now=1000))
         self.assertTrue(all(self.ledger.get_request(f"bulk_{index:04d}")["state"]=="expired" for index in range(750)))
+
+    def test_request_idempotency_binding_is_durable_and_conflicts_fail_closed(self):
+        self.ledger.record_idempotency(principal="agent",idempotency_key="one",fingerprint="f"*64,request_id="req_one",now=100)
+        self.assertEqual("req_one",self.ledger.get_idempotency(principal="agent",idempotency_key="one",fingerprint="f"*64))
+        self.ledger.close(); self.ledger=Ledger(self.path)
+        self.assertEqual("req_one",self.ledger.get_idempotency(principal="agent",idempotency_key="one",fingerprint="f"*64))
+        with self.assertRaisesRegex(ValueError,"different request"):
+            self.ledger.get_idempotency(principal="agent",idempotency_key="one",fingerprint="e"*64)
+        with self.assertRaisesRegex(ValueError,"conflicting"):
+            self.ledger.record_idempotency(principal="agent",idempotency_key="one",fingerprint="e"*64,request_id="req_two",now=101)
+
+    def test_request_projection_compare_and_swap_rejects_stale_writer(self):
+        original={"request_id":"cas","action":"x.y","requester":"agent","state":"authorized","created_at":1,"updated_at":1}
+        self.ledger.record_request(original,event="authorized",actor="human")
+        newer={**original,"state":"executed","updated_at":2}; self.ledger.record_request(newer,event="executed",actor="broker")
+        stale={**original,"state":"consuming","updated_at":3}
+        self.assertFalse(self.ledger.compare_and_swap_request(expected=original,replacement=stale,event="repair",actor="store"))
+        self.assertEqual("executed",self.ledger.get_request("cas")["state"])
 
     def test_pause_and_revocation_are_restrictive_and_persistent(self):
         self.ledger.set_control("pause_all", True, actor="control-panel", now=10)

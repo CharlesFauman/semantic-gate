@@ -14,18 +14,23 @@ access to the downstream effectful tools that Semantic Gate is meant to gate.
 6. Approval ingestion is never exposed as an MCP tool.
 7. Execution is never exposed as an MCP tool.
 8. Every approval depends on notification; every execute depends on both.
-9. Approval evidence is request-, gate- and evidence-ID-bound, TTL-bounded,
-   expiring and single-use within one engine process.
+9. Approval evidence is request-, gate- and evidence-ID-bound and expiring.
+   Version-2 approval issues a separate signed authorization and performs no
+   target call.
 10. Every enforcing approval must have a recheck descendant on the execute path.
 11. Enforcing mode rejects undelivered or misbound notification evidence.
 12. Read evidence tools and effectful target tools use separate registries.
-13. Live execution requires both enforcing policy and host-owned authority.
-14. Target failures are terminal and are never automatically retried.
-15. Default MCP construction trusts no approval evidence and has no authority.
-16. The caller never selects permission mode. `minimum_control` may only raise
+13. Live execution requires signed authorization, enforcing policy, a
+    non-simulated exact target, and broker-owned execution authority.
+14. Authorization consumption is durably reserved before target invocation;
+    replay is rejected across restart.
+15. Timeouts and interrupted consumption become `unknown` and are never
+    automatically retried; explicit reconciliation is required.
+16. Default MCP construction trusts no approval evidence and has no authority.
+17. The caller never selects permission mode. `minimum_control` may only raise
     the effective approval requirement; policy remains authoritative and the
     floor is request-hash/idempotency bound.
-17. Approval levels are closed to ordinary `ask` and `step_up`. Signed evidence
+18. Approval levels are closed to ordinary `ask` and `step_up`. Signed evidence
     carries assurance and the engine rejects evidence below the effective
     request control. The bundled password panel provides ordinary assurance;
     deployments must use an independently authenticated stronger transport for
@@ -42,20 +47,19 @@ A production host must:
 - implement a notifier that provides truthful delivery evidence;
 - verify human approval through an independent authenticated surface;
 - bind approval to request hash, actor, decision and expiry;
-- persist request/evidence state transactionally if restart safety matters;
-- persist idempotency/replay bindings outside the process if callers require
-  them to survive restart; the bundled coordinator expires unresolved snapshots
-  and does not claim cross-restart idempotency;
+- use the bundled durable request-idempotency and authorization stores or an
+  equivalent transactional implementation;
 - protect against duplicate execution at the downstream adapter too;
 - redact sensitive parameters from logs and user-facing notifications;
 - constrain target adapter egress and credentials to least privilege;
 - audit policy and adapter changes.
 
-## Additional v0.2 components
+## Beta components
 
 The optional service supplies durable request snapshots, audit metadata,
 proposal-only REST/HTTP MCP, a simulation control panel, capability-derived
-principals and distributed single-use execution leases. These additions do not
+principals, signed deferred authorization, crash-aware broker state, Ed25519
+human approval, and strict declarative downstream MCP mappings. These do not
 turn the package into an operating-system sandbox or credential vault.
 
 The browser panel requires an exact configured Origin plus a session-bound CSRF
@@ -64,21 +68,18 @@ private HTTP deployments must explicitly opt out and rely on a trusted private
 transport until TLS is available. The service applies strict finite/bounded JSON
 validation to HTTP and MCP bodies and emits no CORS policy.
 
-## What the library does not yet provide
+## What the library does not provide
 
-- crash-resumable transactional engine state for live execution;
 - distributed consensus or locks across coordinator replicas;
-- built-in identity provider or biometric verification;
 - built-in notification provider;
-- built-in downstream MCP client;
 - secret storage;
 - process/container isolation;
 - formal verification of arbitrary adapter code.
 
-The bundled engine and coordinator are appropriate for design, tests,
-simulation and single-process integration. The coordinator expires unresolved
-requests after restart. Do not claim crash-safe exactly-once execution without
-durable execution claims, adapter reconciliation and downstream idempotency.
+The bundled store survives restart and classifies interrupted execution as
+unknown, but cannot prove whether an external target committed before a crash.
+Do not claim exactly-once external effects without downstream idempotency and a
+reconciliation read/receipt.
 
 ## Deployment status language
 
@@ -98,10 +99,11 @@ JSON-RPC string IDs and 1 MiB stdio messages. Hosts may impose tighter limits.
 
 | Version | Security support |
 |---|---|
-| `0.2.x` | Supported |
+| `0.3.0b1` | Current beta |
+| `0.2.x` | Security maintenance during beta |
 | `< 0.2` | Not supported |
 
-Security fixes target the latest `0.2.x` release and current default branch.
+Security fixes target the current beta/default branch and latest `0.2.x` patch.
 Users should upgrade to the newest patch before reporting a regression.
 
 ## Reporting vulnerabilities

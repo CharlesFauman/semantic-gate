@@ -24,6 +24,8 @@ class PolicyBuilderTests(unittest.TestCase):
 
     def test_generates_only_mutating_requestable_actions_with_explicit_principals(self):
         policy = build_policy(self.catalog, self.principals)
+        self.assertEqual(2,policy["version"])
+        self.assertEqual({"audience":"semantic-gate-broker","ttl_seconds":300},policy["authorization"])
         self.assertEqual("simulation_only", policy["mode"])
         self.assertFalse(policy["execution_enabled"])
         self.assertEqual({"home.tv.power_off","purchase.place_order"}, set(policy["workflows"]))

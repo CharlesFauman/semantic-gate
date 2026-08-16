@@ -15,7 +15,7 @@ PYTHONPATH=src python examples/integrations/buzz_approval_flow.py
 Expected result:
 
 ```json
-{"buzz_signature_verification_implemented":false,"effective_control":"step_up","execution_enabled":false,"ok":true,"state":"simulated","trusted_reaction_accepted":true,"untrusted_reaction_rejected":true,"verified_transport_boundary":true}
+{"authorization_consumed":false,"authorization_issued":true,"buzz_signature_verification_implemented":false,"effective_control":"step_up","execution_enabled":false,"ok":true,"state":"authorized","trusted_reaction_accepted":true,"untrusted_reaction_rejected":true,"verified_transport_boundary":true}
 ```
 
 The script uses the real `build_policy`, `CoreBackend`, request hashing,
@@ -50,11 +50,13 @@ Host approval bridge
   ▼
 Semantic Gate
   │ consumes evidence once, rechecks mutable conditions
-  │ simulation: returns simulated without a target call
-  │ enforcing mode: immediately calls the registered target, then returns outcome
+  │ issues signed, durable authorization; no target call
   ▼
 Agent
-  │ independently decides whether to propose any later workflow step
+  │ independently decides whether/when to consume or abandon authorization
+  ▼
+Fixed broker
+  │ atomically reserves, rechecks, then simulates or calls exact target
 ```
 
 ## Exact bindings
@@ -98,9 +100,8 @@ A signed chat service identity is not a human approver. Agent, notifier and brid
 - Duplicate reaction: evidence ID/replay protection prevents reuse.
 - Buzz unavailable: leave the request pending; do not infer approval.
 - Before approval ingestion, the request can be denied, cancelled or allowed to
-  expire. After trusted approval ingestion, the bundled engine immediately
-  advances through rechecks and, in enforcing mode, invokes its registered
-  target; there is no later agent-controlled consumption step in v0.2.
+  expire. After approval, the issued authorization can still be cancelled or
+  abandoned before broker consumption.
 - Broker returns an unknown outcome: do not automatically retry; reconcile target state first.
 
 For a real integration, retain canonical audit data independently of Buzz. Human-facing Buzz messages are a projection, not the authoritative ledger.

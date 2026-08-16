@@ -1,6 +1,17 @@
 """Deterministic semantic permission gates for agent tools."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0b1"
+
+from .authorization import (
+    AuthorizationBroker,
+    AuthorizationError,
+    Ed25519AuthorizationAuthority,
+    Ed25519AuthorizationVerifier,
+    HMACAuthorizationAuthority,
+    SQLiteAuthorizationStore,
+)
+from .approvals import ApprovalTransportError, Ed25519ApprovalRoster, SignedApprovalBridge, sign_approval
+from .adapter_host import AdapterConfigError, DeclarativeAdapterHost, load_adapter_config
 
 from .engine import (
     ApprovalRejected,
@@ -33,6 +44,19 @@ __all__ = [
     "Principal",
     "Recipe",
     "RecipePlugin",
+    "AuthorizationBroker",
+    "AuthorizationError",
+    "Ed25519AuthorizationAuthority",
+    "Ed25519AuthorizationVerifier",
+    "HMACAuthorizationAuthority",
+    "SQLiteAuthorizationStore",
+    "ApprovalTransportError",
+    "Ed25519ApprovalRoster",
+    "SignedApprovalBridge",
+    "sign_approval",
+    "AdapterConfigError",
+    "DeclarativeAdapterHost",
+    "load_adapter_config",
     "SQLiteReplayStore",
     "SemanticGateClient",
 ]

@@ -36,7 +36,7 @@ class PublicReadinessTests(unittest.TestCase):
         required=(
             "Direct Python SDK","HTTP API","MCP","Content-free observer",
             "RecipePlugin","NodeBroker","minimum_control","Policy decides",
-            "advancement is synchronous","Private deployment boundary",
+            "Approval issues permission; it does not execute","Private deployment boundary",
         )
         for value in required: self.assertIn(value,guide)
         self.assertIn("docs/INTEGRATION_GUIDE.md",readme)
@@ -76,7 +76,7 @@ class PublicReadinessTests(unittest.TestCase):
         required={
             "docs/BUZZ_INTEGRATION.md":("End-to-end sequence","Exact bindings","Failure handling","Buzz does not execute"),
             "docs/EXISTING_TOOLS_AND_MCP.md":("Existing MCP servers","read-only precondition","effectful target","remove the raw"),
-            "docs/MULTI_STEP_FLOWS.md":("Agent owns the flow","advances synchronously","Compensation","Unknown outcome"),
+            "docs/MULTI_STEP_FLOWS.md":("Agent owns the flow","approval issues authorization","Compensation","Unknown outcome"),
             "docs/ASSERTIONS.md":("Semantic Gate asserts","Host must assert","Semantic Gate does not assert"),
         }
         readme=(ROOT/"README.md").read_text()
@@ -85,14 +85,58 @@ class PublicReadinessTests(unittest.TestCase):
             self.assertIn(relative,readme)
             for phrase in phrases: self.assertIn(phrase,text,relative)
 
-    def test_docs_describe_current_synchronous_post_approval_semantics(self):
+    def test_docs_describe_deferred_beta_authorization_semantics(self):
         paths=(ROOT/"README.md",ROOT/"docs/INTEGRATION_GUIDE.md",ROOT/"docs/BUZZ_INTEGRATION.md",ROOT/"docs/MULTI_STEP_FLOWS.md")
         combined="\n".join(path.read_text() for path in paths)
-        for false_claim in ("simulated/authorized","consume a bounded authorization later","invoke a separate broker","state\"] != \"authorized\""):
+        for false_claim in ("advances synchronously","immediately calls the registered target","no later agent-controlled consumption","Status:** alpha"):
             self.assertNotIn(false_claim,combined)
         guide=(ROOT/"docs/INTEGRATION_GUIDE.md").read_text()
-        for truth in ("synchronously advances","registered target","does not expose approval ingestion to the agent"):
+        for truth in ("Approval issues permission; it does not execute","atomically reserves","explicit reconciliation"):
             self.assertIn(truth,guide)
+        self.assertNotIn("mark_interrupted_unknown",(ROOT/"src/semantic_gate/httpd.py").read_text())
+        self.assertNotIn("expire_unresolved",(ROOT/"src/semantic_gate/httpd.py").read_text())
+
+    def test_beta_release_documents_are_actionable(self):
+        required={
+            "docs/QUICKSTART.md":("make examples","version 2","authorized"),
+            "docs/BETA.md":("Beta acceptance criteria","Unknown outcomes","Compatibility"),
+            "docs/MIGRATING_TO_0_3.md":("version 1","version 2","SEMANTIC_GATE_AUTHORIZATION_KEY","Rollback"),
+            "docs/ED25519_APPROVALS.md":("semantic-gate[approvals]","public key","semantic-gate-sign-approval"),
+            "docs/ADAPTER_HOST.md":("semantic-gate-adapter-check","absolute","pass_environment"),
+            "CHANGELOG.md":("0.3.0b1","Deferred authorization"),
+        }
+        readme=(ROOT/"README.md").read_text()
+        for relative,phrases in required.items():
+            text=(ROOT/relative).read_text()
+            for phrase in phrases: self.assertIn(phrase,text,relative)
+            if relative.startswith("docs/"): self.assertIn(relative,readme)
+        metadata=(ROOT/"pyproject.toml").read_text(); self.assertIn("Development Status :: 4 - Beta",metadata); self.assertNotIn("Development Status :: 3 - Alpha",metadata)
+        broker_examples=("README.md","ARCHITECTURE.md","examples/README.md","examples/integrations/README.md","docs/EXISTING_TOOLS_AND_MCP.md","examples/integrations/existing_mcp_adapter.py")
+        def broker_calls(text):
+            calls=[]; marker="AuthorizationBroker("; position=0
+            while True:
+                start=text.find(marker,position)
+                if start<0: return calls
+                index=start+len(marker); depth=1; quote=None; escaped=False
+                while index<len(text) and depth:
+                    character=text[index]
+                    if quote:
+                        if escaped: escaped=False
+                        elif character=="\\": escaped=True
+                        elif character==quote: quote=None
+                    elif character in {"'",'"'}: quote=character
+                    elif character=="(": depth+=1
+                    elif character==")": depth-=1
+                    index+=1
+                if depth: return calls
+                calls.append(text[start+len(marker):index-1]); position=index
+        for relative in broker_examples:
+            calls=broker_calls((ROOT/relative).read_text())
+            self.assertTrue(calls,relative)
+            for call in calls:
+                self.assertIn("revocation_checker=",call,relative)
+                self.assertIn("expected_policy_hash=engine.policy_hash",call,relative)
+        self.assertTrue((ROOT/"examples/integrations/ed25519_approval_flow.py").is_file())
 
 
     def test_all_example_workflows_are_valid_and_simulation_only(self):
@@ -103,6 +147,8 @@ class PublicReadinessTests(unittest.TestCase):
                 policy = load_policy(path)
                 self.assertEqual("simulation_only", policy["mode"])
                 self.assertFalse(policy["execution_enabled"])
+                self.assertEqual(2,policy["version"])
+                self.assertIn("authorization",policy)
 
     def test_generic_package_contains_no_private_deployment_identifiers(self):
         forbidden = ("he" + "lm.action.", "fau" + "man", "home" + ":8662", "100.99" + ".36.95")

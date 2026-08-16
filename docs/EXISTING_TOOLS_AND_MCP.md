@@ -11,11 +11,11 @@ PYTHONPATH=src python examples/integrations/existing_mcp_adapter.py
 Expected result:
 
 ```json
-{"agent_facing_mcp_host":true,"direct_agent_target_denied":true,"downstream_processes":2,"effectful_mcp_calls":0,"execution_authority_installed":false,"execution_enabled":false,"local_mock_only":false,"ok":true,"read_mcp_calls":2,"real_stdio_jsonrpc":true,"state":"simulated","would_call":"orders.place"}
+{"agent_facing_mcp_host":true,"approval_state":"authorized","authorization_consumed":true,"authorization_issued":true,"direct_agent_target_denied":true,"downstream_processes":2,"effectful_mcp_calls":0,"execution_authority_installed":true,"execution_enabled":false,"local_mock_only":false,"ok":true,"read_mcp_calls":3,"real_stdio_jsonrpc":true,"state":"simulated"}
 ```
 
 The script uses a real `GatewayEngine`, `ToolRegistry`, gate DAG, notification
-evidence, signed approval evidence and post-approval recheck. It launches two
+evidence, signed approval evidence, durable authorization and broker rechecks. It launches two
 real line-delimited JSON-RPC stdio MCP subprocesses through the included
 `StdioMCPClient`; there is no in-memory MCP stand-in.
 
@@ -41,21 +41,27 @@ Host process
   └── execution broker ──► orders MCP: orders.place
 ```
 
-The agent can propose `order.place`; it cannot call `orders.place` through Semantic Gate's MCP surface. The host registers the inventory check as a **read-only precondition** and the order operation as an **effectful target**. The same inventory tool runs again after approval to reduce time-of-check/time-of-use risk.
+The agent can propose `order.place`; it cannot call `orders.place` through
+Semantic Gate's MCP surface. The inventory query is a read-only precondition.
+Approval issues authorization without a target call. When the agent later chooses consumption, the broker atomically reserves
+the token and runs inventory a third time immediately before the effect. The
+effectful target and its order credential exist only in that broker.
 
 ## Wrapping an existing MCP server
 
 ```python
-inventory = ExistingMCPClient("inventory-mcp")
-orders = ExistingMCPClient("orders-mcp")
-
-registry.register_read(
-    "inventory.available",
-    lambda args: inventory.call_tool("inventory.available", args),
-)
-registry.register_target(
-    "orders.place",
-    lambda args: orders.call_tool("orders.place", args),
+adapter = DeclarativeAdapterHost("adapter-host.json", environment=host_secrets)
+adapter.start()
+registry = adapter.register_reads(ToolRegistry())
+broker = AuthorizationBroker(
+    broker_id="orders-broker",
+    authority=public_authorization_verifier,
+    store=authorization_store,
+    execution_authority=ExecutionAuthority("orders-host"),
+    revocation_checker=current_authorization_is_active,
+    expected_policy_hash=engine.policy_hash,
+    actions=adapter.broker_actions(),
+    clock=clock,
 )
 ```
 

@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import threading
 import time
 from contextlib import contextmanager
@@ -17,6 +18,8 @@ from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from .authorization import HMACAuthorizationAuthority, SQLiteAuthorizationStore
 
 
 class GatePolicyError(ValueError):
@@ -113,7 +116,8 @@ class ToolRegistry:
 
 
 _ACTION = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
-_TOP_FIELDS = {"version", "mode", "execution_enabled", "workflows"}
+_TOP_FIELDS_V1 = {"version", "mode", "execution_enabled", "workflows"}
+_TOP_FIELDS_V2 = _TOP_FIELDS_V1 | {"authorization"}
 _WORKFLOW_FIELDS = {"description", "principals", "target_tool", "parameter_schema", "gates"}
 _GATE_FIELDS = {
     "schema": {"id", "kind", "requires"},
@@ -241,9 +245,16 @@ def _load_policy(source: str | Path | Mapping[str, Any]) -> dict:
     if not isinstance(raw, Mapping):
         raise GatePolicyError("policy must be an object")
     _validate_json_value(raw)
-    _exact_fields(raw, _TOP_FIELDS, "policy")
-    if type(raw["version"]) is not int or raw["version"] != 1:
-        raise GatePolicyError("version must be integer 1")
+    version=raw.get("version")
+    if type(version) is not int or version not in {1,2}:
+        raise GatePolicyError("version must be integer 1 or 2")
+    _exact_fields(raw, _TOP_FIELDS_V1 if version==1 else _TOP_FIELDS_V2, "policy")
+    if version==2:
+        authorization=raw["authorization"]
+        if not isinstance(authorization,Mapping): raise GatePolicyError("authorization config must be an object")
+        _exact_fields(authorization,{"audience","ttl_seconds"},"authorization config")
+        if not isinstance(authorization["audience"],str) or not authorization["audience"]: raise GatePolicyError("authorization audience must be non-empty")
+        if type(authorization["ttl_seconds"]) is not int or authorization["ttl_seconds"]<1: raise GatePolicyError("authorization ttl_seconds must be positive")
     if raw["mode"] not in {"simulation_only", "enforcing"}:
         raise GatePolicyError("mode must be simulation_only or enforcing")
     if not isinstance(raw["execution_enabled"], bool):
@@ -609,14 +620,20 @@ class GatewayEngine:
         notifier: Any | None = None,
         approval_verifier: Any | None = None,
         execution_authority: ExecutionAuthority | None = None,
+        authorization_authority: Any | None = None,
+        authorization_store: SQLiteAuthorizationStore | None = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self.policy = load_policy(policy)
+        self.policy_hash = hashlib.sha256(_canonical(self.policy).encode("utf-8")).hexdigest()
         self.registry = registry or ToolRegistry()
         self.notifier = notifier or RecordingNotifier()
         self.approval_verifier = approval_verifier or DenyAllApprovalVerifier()
         self.execution_authority = execution_authority
+        self.authorization_authority = authorization_authority
+        self.authorization_store = authorization_store
+
         self.clock = clock or (lambda: int(time.time()))
         self._requests: dict[str, dict] = {}
         self._request_workflows: dict[str, dict] = {}
@@ -745,6 +762,7 @@ class GatewayEngine:
             "blocked_by": None,
             "notification_delivered": False,
             "execution_possible": False,
+            "consumption_possible": False,
             "created_at": self.clock(),
             "gates": [
                 {"id": gate["id"], "kind": gate["kind"], "status": "pending", "evidence": None}
@@ -766,6 +784,7 @@ class GatewayEngine:
             raise GatePolicyError(f"request not found: {request_id}")
         public = _copy(self._requests[request_id])
         trusted = public.pop("trusted_context", {})
+        public.pop("authorization_token",None)
         public["trusted_context_hash"] = hashlib.sha256(_canonical(trusted).encode("utf-8")).hexdigest()
         return public
 
@@ -797,7 +816,14 @@ class GatewayEngine:
             raise GatePolicyError("only the original requester may cancel")
         if request["state"] in self.TERMINAL:
             raise GatePolicyError("terminal request cannot be cancelled")
+        authorization=request.get("authorization")
+        if authorization is not None:
+            if self.authorization_store is None: raise GatePolicyError("authorization store is unavailable")
+            try: self.authorization_store.cancel(authorization["authorization_id"],now=int(self.clock()))
+            except Exception as error: raise GatePolicyError(f"authorization cannot be revoked: {type(error).__name__}") from error
+            authorization["status"]="cancelled"
         request["state"] = "cancelled"
+        request["consumption_possible"] = False
         self._release_terminal_workflow(request)
         return self.get_request(request_id)
 
@@ -861,6 +887,7 @@ class GatewayEngine:
             "request_hash": request["request_hash"],
             "expires_at": expires_at,
             "consumed_at": self.clock(),
+            "provenance": _copy(evidence.get("provenance",{})),
         }
         request["state"] = "processing"
         self._advance(request, workflow)
@@ -984,6 +1011,49 @@ class GatewayEngine:
                         for gate_id in approval_ids
                     ):
                         self._block(request, gate, {"reason": "approval_expired"})
+                        return
+                    if self.policy["version"] == 2:
+                        if self.authorization_authority is None or self.authorization_store is None:
+                            gate["status"]="failed"; gate["evidence"]={"error_type":"MissingAuthorizationAuthorityOrStore","retry_allowed":False}
+                            request["state"]="failed"; request["execution_possible"]=False
+                            return
+                        now=int(self.clock()); config=self.policy["authorization"]
+                        approval_evidence_ids=sorted(runtime[gate_id]["evidence"]["evidence_id"] for gate_id in approval_ids)
+                        expires_at=min([now+int(config["ttl_seconds"])]+[runtime[gate_id]["evidence"]["expires_at"] for gate_id in approval_ids])
+                        claims={
+                            "authorization_id":"auth_"+secrets.token_hex(16),
+                            "issuer":self.authorization_authority.issuer,
+                            "audience":config["audience"],
+                            "request_id":request["request_id"],
+                            "request_hash":request["request_hash"],
+                            "requester":request["requester"],
+                            "assurance":request["effective_control"],
+                            "action":request["action"],
+                            "target":definition["tool"],
+                            "parameters":_copy(request["parameters"]),
+                            "parameters_hash":"",
+                            "policy_hash":self.policy_hash,
+                            "approval_evidence_ids":approval_evidence_ids,
+                            "approval_provenance":{runtime[gate_id]["evidence"]["evidence_id"]:_copy(runtime[gate_id]["evidence"].get("provenance",{})) for gate_id in sorted(approval_ids)},
+                            "issued_at":now,
+                            "expires_at":expires_at,
+                            "nonce":secrets.token_hex(16),
+                            "execution_enabled":self.policy["execution_enabled"],
+                            "simulation_only":definition["simulation_only"],
+                        }
+                        try:
+                            token=self.authorization_authority.issue(claims)
+                            gate["status"]="authorized"
+                            gate["evidence"]={"authorization_id":token["authorization_id"],"audience":token["audience"],"expires_at":token["expires_at"]}
+                            request["authorization_token"]=token
+                            request["authorization"]={"authorization_id":token["authorization_id"],"audience":token["audience"],"action":token["action"],"target":token["target"],"parameters_hash":token["parameters_hash"],"issued_at":token["issued_at"],"expires_at":token["expires_at"],"status":"issued"}
+                            request["state"]="authorized"; request["execution_possible"]=False; request["consumption_possible"]=True
+                            self.authorization_store.record_issued(token,request_snapshot=self.get_request(request["request_id"]))
+                        except Exception as error:
+                            request.pop("authorization_token",None); request.pop("authorization",None)
+                            gate["status"]="failed"; gate["evidence"]={"error_type":type(error).__name__,"retry_allowed":False}
+                            request["state"]="failed"; request["execution_possible"]=False; request["consumption_possible"]=False
+                            return
                         return
                     if definition["simulation_only"] or not self.policy["execution_enabled"]:
                         gate["status"] = "simulated"

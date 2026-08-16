@@ -24,7 +24,7 @@ Supported gates:
 | `tool` | Call a host-registered read-only precondition tool and test its result |
 | `notify` | Call the host notifier and retain delivery evidence |
 | `approval` | Stop until host-verified, exact request-bound evidence arrives |
-| `execute` | Simulate or call the host-registered target after all dependencies pass |
+| `execute` | Version 2: issue target-bound authorization; version 1: deprecated inline simulation/execution |
 
 Every execute node is statically required to have notification and approval in
 its ancestor graph. Cycles, unknown dependencies and undeclared fields fail at
@@ -38,6 +38,7 @@ policy load time.
 processing
   ├─ blocked
   ├─ waiting_for_approval
+  ├─ authorized
   ├─ simulated
   ├─ executed
   ├─ failed
@@ -47,7 +48,7 @@ processing
 A request contains a canonical SHA-256 hash over action, parameters, context,
 trusted host context, requester, idempotency key and the complete workflow.
 Idempotency keys are therefore bound to one exact request and cannot be reused
-for a materially different proposal.
+for a materially different proposal. The coordinator persists that binding.
 
 Agent-supplied `context` and host-supplied `trusted_context` are separate. Gate
 conditions may inspect either, but any fact that grants power should use
@@ -91,20 +92,23 @@ Enforcing mode rejects simulated, undelivered, stale/misbound or reused evidence
 
 The MCP server uses `DenyAllApprovalVerifier`.
 
-### Execution authority
+### Deferred authorization and execution authority
 
-An enforcing policy is not enough. The embedding host must also instantiate and
-pass an `ExecutionAuthority`. The default MCP builder never does this.
+For version 2, approval plus post-approval rechecks produce a signed token. The
+engine does not hold target credentials and does not call the target. An
+`AuthorizationBroker` with the addressed verification key, durable store, fixed
+action map and host-owned `ExecutionAuthority` consumes later.
 
 This is intentional separation of duties:
 
 ```text
 checked-in policy permits execution
-AND host process enables execution mode
-AND host registered the exact target
+AND signed authorization matches broker audience/action/target/parameters/policy
+AND broker atomically reserves an unconsumed, unexpired token
+AND consumption-time recheck passes
+AND broker fixed-map owns the exact target
 AND trusted approval was ingested out of band
-AND all current preconditions pass
-AND host supplied execution authority
+AND broker host supplied execution authority
 ```
 
 ### Coordinator service and durable projection
@@ -114,11 +118,10 @@ SQLite snapshots/audit metadata, emergency pause/revocation controls, REST,
 HTTP MCP and a human simulation-review panel. Requester identity and trusted
 context are derived by the host transport, not accepted from tool arguments.
 
-The current storage layer is deliberately fail-closed rather than crash-resuming:
-unresolved snapshots are marked expired when the service restarts. It is useful
-for complete simulation and policy review, but live execution requires a future
-transactional engine/store integration with durable gate evidence, execution
-claims and downstream idempotency.
+Pending approvals expire on coordinator restart. Authorized requests and
+request-idempotency bindings remain durable. Broker consumption transitions
+`issued → executing` transactionally; startup recovery changes interrupted
+`executing` rows to `unknown`, which requires explicit reconciliation.
 
 ### Distributed nodes and plugins
 
@@ -142,13 +145,23 @@ not serializable over that interface.
 
 ## Adapting downstream MCP tools
 
-A host can wrap a downstream MCP client call inside a registered callable:
+A host can map downstream MCP calls declaratively:
 
 ```python
-registry.register_read("crm.customer_exists", lambda args: downstream.call("customer_exists", args))
-registry.register_target("crm.create_ticket", lambda args: downstream.call("create_ticket", args))
+host = DeclarativeAdapterHost("adapter-host.json", environment=secret_environment)
+host.start()
+broker = AuthorizationBroker(
+    broker_id="reviewed-broker",
+    authority=public_authorization_verifier,
+    store=authorization_store,
+    execution_authority=ExecutionAuthority("reviewed-host"),
+    revocation_checker=current_authorization_is_active,
+    expected_policy_hash=engine.policy_hash,
+    actions=host.broker_actions(),
+    clock=clock,
+)
 ```
 
-Keep the downstream client and credentials outside the agent-facing process when
-stronger isolation is required. Semantic Gate's registry is an interface, not a
-credential vault or process sandbox.
+Commands and tool names are fixed in checked-in config; only explicitly named
+environment variables reach each subprocess. Remove the raw effectful MCP and
+credentials from the agent before calling an action enforced.

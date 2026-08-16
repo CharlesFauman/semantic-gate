@@ -140,7 +140,9 @@ def approval_for(request: dict, *, expires_at: int = 1_700_000_300, approval_gat
 
 class SemanticGateEngineTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.policy = load_policy(ROOT / "examples" / "calendar-booking" / "workflow.json")
+        fixture=json.loads((ROOT / "examples" / "calendar-booking" / "workflow.json").read_text())
+        fixture["version"]=1; fixture.pop("authorization",None)
+        self.policy = load_policy(fixture)
         self.clock = Clock()
         self.notifier = RecordingNotifier()
         self.registry = ToolRegistry()

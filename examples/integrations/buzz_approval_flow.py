@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
+import tempfile
 
+from semantic_gate.authorization import SQLiteAuthorizationStore
 from semantic_gate.catalog import build_policy
 from semantic_gate.coordinator import CoreBackend
 
@@ -57,17 +60,23 @@ class BuzzApprovalBridge:
 def main() -> None:
     clock=Clock(); buzz=UnsignedBuzzTransportStub()
     catalog={"version":1,"actions":{"document.publish":{"domain":"document","risk":"R2","effect":"external_write","summary":"Publish one reviewed document.","approval":"separate_confirmation","privacy_classes":[],"constraints":["Exact document and destination required."]}}}
-    backend=CoreBackend(build_policy(catalog,{"example-agent":{"role":"agent","enabled":True}}),approval_key=b"example-approval-key-material-32b",clock=clock,notifier=BuzzNotifier(buzz,clock))
-    request=backend.request_action(action="document.publish",parameters={"summary":"Publish reviewed guide","target":"example-site","details":{"document_id":"guide-v1"}},context={"surface":"example"},trusted_context={"surface":"example"},requester="example-agent",idempotency_key="buzz-flow-1",minimum_control="step_up")
-    notice=next(g for g in request["gates"] if g["kind"]=="notify")["evidence"]["notification_id"]
-    bridge=BuzzApprovalBridge(backend,buzz,{"owner-key"},clock)
-    buzz.add_transport_verified_reaction(notice,"👍","untrusted-key",clock())
-    assert bridge.scan(request["request_id"]) is False
-    buzz.add_transport_verified_reaction(notice,"👍","owner-key",clock())
-    assert bridge.scan(request["request_id"]) is True
-    result=backend.get_request(request["request_id"])
-    assert result["state"]=="simulated" and result["effective_control"]=="step_up"
-    print(json.dumps({"ok":True,"execution_enabled":False,"state":result["state"],"effective_control":result["effective_control"],"verified_transport_boundary":True,"buzz_signature_verification_implemented":False,"trusted_reaction_accepted":True,"untrusted_reaction_rejected":True},sort_keys=True))
+    with tempfile.TemporaryDirectory() as tmp:
+        store=SQLiteAuthorizationStore(Path(tmp)/"authorization.sqlite3")
+        try:
+            backend=CoreBackend(build_policy(catalog,{"example-agent":{"role":"agent","enabled":True}}),approval_key=b"example-approval-key-material-32b",authorization_key=b"example-authorization-key-material",authorization_store=store,clock=clock,notifier=BuzzNotifier(buzz,clock))
+            request=backend.request_action(action="document.publish",parameters={"summary":"Publish reviewed guide","target":"example-site","details":{"document_id":"guide-v1"}},context={"surface":"example"},trusted_context={"surface":"example"},requester="example-agent",idempotency_key="buzz-flow-1",minimum_control="step_up")
+            notice=next(g for g in request["gates"] if g["kind"]=="notify")["evidence"]["notification_id"]
+            bridge=BuzzApprovalBridge(backend,buzz,{"owner-key"},clock)
+            buzz.add_transport_verified_reaction(notice,"👍","untrusted-key",clock())
+            assert bridge.scan(request["request_id"]) is False
+            buzz.add_transport_verified_reaction(notice,"👍","owner-key",clock())
+            assert bridge.scan(request["request_id"]) is True
+            result=backend.get_request(request["request_id"])
+            authorization=result["authorization"]
+            assert result["state"]=="authorized" and result["effective_control"]=="step_up"
+            assert store.get(authorization["authorization_id"])["state"]=="issued"
+            print(json.dumps({"ok":True,"execution_enabled":False,"state":result["state"],"effective_control":result["effective_control"],"authorization_issued":True,"authorization_consumed":False,"verified_transport_boundary":True,"buzz_signature_verification_implemented":False,"trusted_reaction_accepted":True,"untrusted_reaction_rejected":True},sort_keys=True))
+        finally: store.close()
 
 
 if __name__=="__main__": main()

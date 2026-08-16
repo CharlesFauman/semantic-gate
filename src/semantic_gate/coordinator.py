@@ -6,8 +6,10 @@ import hashlib
 import hmac
 import json
 import secrets
+import re
 from typing import Any
 
+from .authorization import HMACAuthorizationAuthority, SQLiteAuthorizationStore
 from .engine import ApprovalRejected, GatewayEngine, ToolRegistry
 from .engine import RecordingNotifier
 
@@ -37,7 +39,8 @@ class HostApprovalVerifier:
 
 
 class CoreBackend:
-    def __init__(self, policy: dict, *, approval_key: bytes, clock, notifier=None):
+    def __init__(self, policy: dict, *, approval_key: bytes, clock, notifier=None, authorization_key: bytes | None = None, authorization_authority: Any | None = None, authorization_store: SQLiteAuthorizationStore | None = None):
+        if authorization_key is not None and authorization_authority is not None: raise ValueError("provide authorization_key or authorization_authority, not both")
         self.clock = clock
         self.verifier = HostApprovalVerifier(approval_key)
         registry = ToolRegistry()
@@ -54,6 +57,8 @@ class CoreBackend:
             notifier=notifier or RecordingNotifier(),
             approval_verifier=self.verifier,
             execution_authority=None,
+            authorization_authority=authorization_authority or (HMACAuthorizationAuthority(authorization_key,issuer="semantic-gate-coordinator") if authorization_key is not None else None),
+            authorization_store=authorization_store,
             clock=self.clock,
         )
 
@@ -74,9 +79,14 @@ class CoreBackend:
     def cancel_request(self, request_id: str, requester: str):
         return self.engine.cancel_request(request_id, requester=requester)
 
-    def approve_request(self, request_id: str, actor: str, assurance: str = "ask"):
+    def approve_request(self, request_id: str, actor: str, assurance: str = "ask", evidence_id: str | None = None, provenance: dict | None = None):
         if assurance not in {"ask","step_up"}:
             raise ApprovalRejected("approval assurance is invalid")
+        if evidence_id is not None and (not isinstance(evidence_id,str) or not evidence_id): raise ApprovalRejected("approval evidence_id is invalid")
+        provenance=dict(provenance or {"transport":"hmac-host"})
+        if provenance=={"transport":"hmac-host"}: pass
+        elif set(provenance)=={"transport","key_id","signed_at","signature_sha256"} and provenance["transport"]=="ed25519" and isinstance(provenance["key_id"],str) and bool(provenance["key_id"]) and type(provenance["signed_at"]) is int and isinstance(provenance["signature_sha256"],str) and re.fullmatch(r"[0-9a-f]{64}",provenance["signature_sha256"]): pass
+        else: raise ApprovalRejected("approval provenance is invalid")
         request = self.engine.get_request(request_id)
         approval = next(
             gate for gate in request["gates"]
@@ -84,7 +94,7 @@ class CoreBackend:
         )
         ttl = int(approval["evidence"]["ttl_seconds"])
         evidence = {
-            "evidence_id": "approval_" + secrets.token_hex(16),
+            "evidence_id": evidence_id or "approval_" + secrets.token_hex(16),
             "request_id": request_id,
             "request_hash": request["request_hash"],
             "approval_gate_id": approval["id"],
@@ -92,6 +102,7 @@ class CoreBackend:
             "decision": "approve",
             "assurance": assurance,
             "expires_at": int(self.clock()) + ttl,
+            "provenance": provenance,
         }
         evidence["signature"] = self.verifier.sign(evidence)
         return self.engine.ingest_trusted_approval(request_id, evidence)

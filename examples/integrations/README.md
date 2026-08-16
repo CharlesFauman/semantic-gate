@@ -74,8 +74,8 @@ a **demo-only** replacement: it starts the two
 bundled `example_downstream_mcp.py` processes. It does not automatically wrap
 the `inventory-mcp` and `orders-mcp` commands shown in the “before” example.
 
-`--serve` launches an agent-facing Semantic Gate MCP. Inside that trusted host
-process, the demo registers one read adapter and one effectful target adapter.
+`--serve` launches an agent-facing Semantic Gate MCP with read adapters only.
+The effectful client is reachable only through `AuthorizationBroker`.
 
 ### Production migration
 
@@ -104,17 +104,9 @@ Create a private, reviewed host based on `existing_mcp_adapter.py`:
 The resulting fixed adapter shape is:
 
 ```python
-inventory = StdioMCPClient(["/absolute/reviewed/inventory-mcp"])
-orders = StdioMCPClient(["/absolute/reviewed/orders-mcp"])
-
-registry.register_read(
-    "inventory.available",
-    lambda args: inventory.call_tool("inventory.available", args),
-)
-registry.register_target(
-    "orders.place",
-    lambda args: orders.call_tool("orders.place", args),
-)
+adapter = DeclarativeAdapterHost("adapter-host.json", environment=host_secrets)
+adapter.start()
+registry = adapter.register_reads(ToolRegistry())
 
 # Only in the reviewed production host, after policy and credential isolation:
 engine = GatewayEngine(
@@ -122,7 +114,18 @@ engine = GatewayEngine(
     registry=registry,
     notifier=trusted_notifier,
     approval_verifier=trusted_approval_verifier,
+    authorization_authority=private_authorization_signer,
+    authorization_store=authorization_store,
+)
+broker = AuthorizationBroker(
+    broker_id="orders-broker",
+    authority=public_authorization_verifier,
+    store=authorization_store,
     execution_authority=ExecutionAuthority("reviewed-production-host"),
+    revocation_checker=current_authorization_is_active,
+    expected_policy_hash=engine.policy_hash,
+    actions=adapter.broker_actions(),
+    clock=clock,
 )
 ```
 
@@ -138,9 +141,9 @@ make example-mcp
 make example-mcp-host
 ```
 
-`example-mcp` executes the full in-process host/approval simulation: inventory
-runs twice (precheck and recheck), while the effectful orders MCP receives zero
-calls. `example-mcp-host` launches the same file with `--serve`, connects as a
+`example-mcp` executes the full deferred simulation: inventory runs for policy
+precheck, post-approval check and consumption-time broker recheck, while the
+effectful orders MCP receives zero calls. `example-mcp-host` launches `--serve`, connects as a
 real MCP client, lists actions and submits a proposal that reaches
 `waiting_for_approval`.
 
@@ -153,10 +156,11 @@ wiring without contacting a real service, run:
 make example-mcp-enforcing-mock
 ```
 
-This explicit local mock mode installs `ExecutionAuthority`, uses
+This explicit local mock mode issues authorization, then the agent chooses
+broker consumption. The broker installs `ExecutionAuthority`, uses
 `mode="enforcing"`, `execution_enabled=true` and `simulation_only=false`, proves
-the agent-facing MCP cannot call `orders.place` directly, then submits exact
-approval evidence and calls the bundled local orders MCP exactly once. Expected
+the agent-facing MCP cannot call `orders.place` directly, and calls the bundled
+local orders MCP exactly once. Expected
 result includes:
 
 ```json

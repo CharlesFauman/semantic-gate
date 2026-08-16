@@ -12,7 +12,7 @@ license = "MIT"
 authors = [{name = "Semantic Gate contributors"}]
 keywords = ["agents", "mcp", "permissions", "policy", "approval", "security"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
@@ -23,9 +23,15 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+approvals = ["cryptography>=42"]
+
 [project.scripts]
 semantic-gate-mcp = "semantic_gate.mcp:main"
 semantic-gate-server = "semantic_gate.httpd:main"
+semantic-gate-sign-approval = "semantic_gate.approvals:main"
+semantic-gate-adapter-check = "semantic_gate.adapter_host:main"
+semantic-gate-authorizations = "semantic_gate.authorization_admin:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

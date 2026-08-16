@@ -26,7 +26,7 @@ Semantic Gate borrows established security patterns rather than inventing an age
 6. Local and remote execution use the same request and approval graph.
 7. Distributed execution uses a single-use, expiring lease bound to request, policy, node, plugin, action and parameter hash.
 8. Node plugins expose reviewed semantic recipes. They do not expose generic shell, AppleScript text, PowerShell text, GUI coordinates or arbitrary keystrokes.
-9. Deferred requests are durable, but restart behavior fails closed. The current coordinator expires unresolved snapshots rather than reviving them.
+9. Version-2 authorized requests and request idempotency survive coordinator restart. Broker `executing` records remain reserved until explicit operator-confirmed recovery to `unknown`; unresolved pending approvals require explicit cancellation and reproposal.
 10. A deployment must distinguish catalogued, shadowed and enforced actions. A gate is not an enforcement boundary while the agent retains direct credentials, shell access or raw downstream tools.
 
 ## Deliberate differences

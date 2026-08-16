@@ -5,9 +5,10 @@ on:
 permissions:
   contents: read
 jobs:
-  test:
+  core:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.9", "3.11", "3.13"]
     steps:
@@ -16,4 +17,28 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install --no-deps -e .
-      - run: python -m unittest discover -s tests -v
+      - run: python -W error::ResourceWarning -m unittest discover -s tests -v
+      - run: make examples PYTHON=python
+  approvals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e '.[approvals]'
+      - run: python -m unittest -v tests.test_ed25519_approvals tests.test_ed25519_authorization
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install build
+      - run: python -m build
+      - run: python -m venv /tmp/semantic-gate-wheel
+      - run: /tmp/semantic-gate-wheel/bin/python -m pip install --no-deps dist/*.whl
+      - run: /tmp/semantic-gate-wheel/bin/python -c 'import importlib.metadata,semantic_gate; assert semantic_gate.__version__ == importlib.metadata.version("semantic-gate") == "0.3.0b1"'
+      - run: make examples PYTHON=/tmp/semantic-gate-wheel/bin/python EXAMPLE_ENV=
+      - run: make example-mcp-enforcing-mock PYTHON=/tmp/semantic-gate-wheel/bin/python EXAMPLE_ENV=

@@ -6,9 +6,9 @@ These examples demonstrate the same generic gate engine across unrelated domains
 - `purchase-approval/` — inventory and budget checks, then approval and inventory recheck.
 - `device-control/` — allowlisted target, safety check, approval and safety recheck.
 
-Every checked-in example is `simulation_only` with execution disabled. Names,
-providers and targets are placeholders. There are no live URLs, credentials or
-environment-specific identifiers.
+Every default example is `simulation_only` with execution disabled. The only
+opt-in enforcing path calls a bundled local mock. Names, providers and targets
+are placeholders; there are no live URLs or credentials.
 
 ## Runnable integration flows
 
@@ -34,30 +34,42 @@ concepts here without copying private details back into this repository:
 
 ```python
 from semantic_gate import GatewayEngine, ToolRegistry, RecordingNotifier
+from semantic_gate.authorization import AuthorizationBroker
 from semantic_gate.engine import load_policy
 
 registry = ToolRegistry()
 registry.register_read("calendar.no_conflict", my_read_only_conflict_check)
-registry.register_target("calendar.create_event", my_effectful_calendar_adapter)
+
 
 engine = GatewayEngine(
     load_policy("private/workflow.json"),
     registry=registry,
     notifier=my_trusted_notification_adapter,
     approval_verifier=my_out_of_band_approval_verifier,
+    authorization_authority=my_private_signer,
+    authorization_store=my_durable_store,
+)
+
+broker = AuthorizationBroker(
+    broker_id="calendar-broker",
+    authority=my_public_verifier,
+    store=my_durable_store,
     execution_authority=my_host_owned_execution_authority,
+    revocation_checker=current_authorization_is_active,
+    expected_policy_hash=engine.policy_hash,
+    actions=my_fixed_action_map,
+    clock=clock,
 )
 ```
 
-The agent-facing MCP never receives `my_out_of_band_approval_verifier` or
-`my_host_owned_execution_authority`. A private adapter may call any API, local
-service, MCP tool or operating-system integration, but Semantic Gate sees it only
-as a named host-registered callable with a declared role:
+The agent-facing MCP never receives approval signing or execution authority.
+The engine sees read tools; the broker alone sees effectful targets and credentials.
 
 - **read tool** — may produce precondition evidence;
 - **notifier** — must return delivery evidence;
 - **approval verifier** — accepts only exact, unexpired, request-bound evidence;
-- **target tool** — effectful and unreachable until every gate has passed.
+- **authorization signer** — issues exact, expiring broker permission;
+- **target tool** — effectful and reachable only through broker consumption.
 
 To publish a genericized example from a private integration:
 

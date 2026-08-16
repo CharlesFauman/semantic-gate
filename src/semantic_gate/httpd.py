@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .auth import CapabilityAuthority
+from .authorization import SQLiteAuthorizationStore
 from .catalog import build_policy
 from .controller import GateControl
 from .coordinator import CoreBackend
@@ -22,7 +23,7 @@ MAX_BODY = 1_048_576
 
 def make_http_server(app: SemanticGateApplication, bind: str, port: int) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "SemanticGate/0.2"
+        server_version = "SemanticGate/0.3"
 
         def _handle(self):
             try:
@@ -70,16 +71,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         master=bytes.fromhex(os.environ["SEMANTIC_GATE_MASTER_KEY"])
         approval=bytes.fromhex(os.environ["SEMANTIC_GATE_APPROVAL_KEY"])
+        authorization=bytes.fromhex(os.environ["SEMANTIC_GATE_AUTHORIZATION_KEY"])
         password=os.environ["SEMANTIC_GATE_ADMIN_PASSWORD"]
     except (KeyError,ValueError) as error:
         parser.error(f"required secret is missing or invalid: {error}")
     catalog=_json(args.catalog); principals=_json(args.principals)["principals"]
-    ledger=Ledger(args.database); ledger.expire_unresolved(now=int(time.time()))
-    backend=CoreBackend(build_policy(catalog,principals),approval_key=approval,clock=lambda:int(time.time()))
-    app=SemanticGateApplication(GateControl(backend,ledger,clock=lambda:int(time.time())),CapabilityAuthority(master,principals),CredentialRegistry(args.credentials),catalog=catalog,admin_password=password,admin_principal_id=args.admin_principal,origins=[args.origin],clock=lambda:int(time.time()))
+    ledger=Ledger(args.database)
+    authorization_store=SQLiteAuthorizationStore(args.database)
+    backend=CoreBackend(build_policy(catalog,principals),approval_key=approval,authorization_key=authorization,authorization_store=authorization_store,clock=lambda:int(time.time()))
+    app=SemanticGateApplication(GateControl(backend,ledger,clock=lambda:int(time.time()),authorization_store=authorization_store),CapabilityAuthority(master,principals),CredentialRegistry(args.credentials),catalog=catalog,admin_password=password,admin_principal_id=args.admin_principal,origins=[args.origin],clock=lambda:int(time.time()))
     server=make_http_server(app,args.bind,args.port)
     try: server.serve_forever()
-    finally: server.server_close(); ledger.close()
+    finally: server.server_close(); authorization_store.close(); ledger.close()
     return 0
 
 

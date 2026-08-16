@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Transport-independent policy controller around Semantic Gate."""
 from __future__ import annotations
+import hashlib
+import json
 import re
 
 from typing import Any, Mapping
@@ -18,10 +20,11 @@ class GateControl:
     OBSERVATION_FIELDS = {"event_id","phase","operation","semantic_class","outcome","occurred_at","metadata"}
     OBSERVATION_METADATA_KEYS = {"surface","node","harness","duration_ms","status","error_type","dropped_events","toolset","version"}
 
-    def __init__(self, backend: Any, ledger: Ledger, *, clock):
+    def __init__(self, backend: Any, ledger: Ledger, *, clock, authorization_store: Any | None = None):
         self.backend = backend
         self.ledger = ledger
         self.clock = clock
+        self.authorization_store=authorization_store
 
     def _allowed(self, principal: str, action: str):
         controls = self.ledger.controls()
@@ -32,6 +35,27 @@ class GateControl:
         domain = action.split(".", 1)[0]
         if domain in controls["paused_domains"]:
             raise GateControlError(f"action domain is paused: {domain}")
+
+    def _sync_authorization(self,request: dict) -> dict:
+        authorization=request.get("authorization")
+        getter=getattr(self.authorization_store,"get",None)
+        if isinstance(authorization,dict) and callable(getter): record=getter(authorization.get("authorization_id"))
+        else:
+            by_request=getattr(self.authorization_store,"get_for_request",None)
+            record=by_request(request["request_id"]) if callable(by_request) else None
+        if not isinstance(record,dict): return request
+        stored_snapshot=record.get("request_snapshot")
+        if not isinstance(authorization,dict) and isinstance(stored_snapshot,dict):
+            repaired=dict(stored_snapshot)
+        else:
+            state=record.get("state"); public_state={"issued":"authorized","executing":"consuming","unknown":"outcome_unknown"}.get(state,state)
+            if not isinstance(public_state,str): return request
+            if request.get("state")==public_state and authorization.get("status")==state: return request
+            repaired=dict(request); repaired["authorization"]=dict(authorization); repaired["authorization"]["status"]=state
+            if record.get("receipt") is not None: repaired["authorization"]["receipt"]=record["receipt"]
+            repaired["state"]=public_state; repaired["consumption_possible"]=state=="issued"; repaired["updated_at"]=int(record.get("updated_at",self.clock()))
+        if self.ledger.compare_and_swap_request(expected=request,replacement=repaired,event="authorization_projection_repaired",actor="authorization-store"): return repaired
+        return self.ledger.get_request(request["request_id"]) or request
 
     @staticmethod
     def _payload(payload: Mapping[str, Any]) -> dict:
@@ -63,6 +87,17 @@ class GateControl:
     def request_action(self, *, principal: str, payload: Mapping[str, Any], host_context: Mapping[str, Any]):
         data = self._payload(payload)
         self._allowed(principal, data["action"])
+        try:
+            encoded=json.dumps({"request":data,"host_context":dict(host_context)},sort_keys=True,separators=(",",":"),allow_nan=False)
+        except (TypeError,ValueError,OverflowError,RecursionError) as error:
+            raise GateControlError("request and host context must be strict JSON") from error
+        fingerprint=hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        try: existing_id=self.ledger.reserve_idempotency(principal=principal,idempotency_key=data["idempotency_key"],fingerprint=fingerprint,now=int(self.clock()))
+        except ValueError as error: raise GateControlError(str(error)) from error
+        if existing_id is not None:
+            existing=self.ledger.get_request(existing_id)
+            if existing is None: raise GateControlError("idempotency binding references a missing request")
+            return existing
         request = self.backend.request_action(
             action=data["action"],
             parameters=dict(data["parameters"]),
@@ -74,7 +109,8 @@ class GateControl:
         )
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
-        self.ledger.record_request(request, event="requested", actor=principal)
+        try: self.ledger.complete_reserved_request(request,principal=principal,idempotency_key=data["idempotency_key"],fingerprint=fingerprint,event="requested",actor=principal)
+        except ValueError as error: raise GateControlError(str(error)) from error
         return request
 
     def observe(self, *, principal: str, payload: Mapping[str, Any]):
@@ -106,7 +142,8 @@ class GateControl:
             raise GateControlError("request not found")
         if not admin and request["requester"] != principal:
             raise GateControlError("principal cannot access this request")
-        if request["state"] in {"blocked", "cancelled", "simulated", "executed", "failed", "expired", "denied"}:
+        request=self._sync_authorization(request)
+        if request["state"] in {"blocked", "cancelled", "simulated", "executed", "failed", "expired", "denied", "authorized", "consuming", "outcome_unknown"}:
             return request
         live = self.backend.get_request(request_id, requester=None if admin else principal)
         live["updated_at"] = request.get("updated_at", request["created_at"])
@@ -114,11 +151,25 @@ class GateControl:
         return live
 
     def list_requests(self, *, principal: str, admin: bool = False, limit: int = 100):
-        requests = self.ledger.list_requests(limit=limit)
+        requests = [self._sync_authorization(item) for item in self.ledger.list_requests(limit=limit)]
         return requests if admin else [item for item in requests if item["requester"] == principal]
 
     def cancel(self, request_id: str, *, principal: str):
-        request = self.backend.cancel_request(request_id, requester=principal)
+        persisted=self.ledger.get_request(request_id)
+        if persisted is not None and persisted.get("state")=="cancelled":
+            if persisted["requester"]!=principal: raise GateControlError("only the original requester may cancel")
+            return persisted
+        if persisted is not None and persisted.get("state")=="authorized":
+            if persisted["requester"]!=principal: raise GateControlError("only the original requester may cancel")
+            if self.authorization_store is None: raise GateControlError("authorization store is unavailable")
+            try: self.authorization_store.cancel(persisted["authorization"]["authorization_id"],now=int(self.clock()))
+            except Exception as error: raise GateControlError(f"authorization cannot be revoked: {type(error).__name__}") from error
+            persisted["state"]="cancelled"; persisted["authorization"]["status"]="cancelled"; persisted["consumption_possible"]=False; persisted["updated_at"]=int(self.clock())
+            self.ledger.record_request(persisted,event="cancelled",actor=principal); return persisted
+        try: request = self.backend.cancel_request(request_id, requester=principal)
+        except Exception:
+            if persisted is None or persisted.get("requester")!=principal or persisted.get("state") not in {"processing","waiting_for_approval"}: raise
+            request=dict(persisted); request["state"]="cancelled"
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
         self.ledger.record_request(request, event="cancelled", actor=principal)
@@ -132,7 +183,8 @@ class GateControl:
         request = self.backend.approve_request(request_id, actor=actor, assurance=assurance)
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
-        self.ledger.record_request(request, event="approved", actor=actor)
+        event="authorized" if request.get("state")=="authorized" else "approved"
+        self.ledger.record_request(request, event=event, actor=actor)
         return request
 
     def deny(self, request_id: str, *, actor: str, actor_role: str):
@@ -141,10 +193,16 @@ class GateControl:
         prior = self.ledger.get_request(request_id)
         if prior is None:
             raise GateControlError("request not found")
-        try:
-            request = self.backend.cancel_request(request_id, requester=prior["requester"])
-        except Exception:
-            request = dict(prior)
+        if prior.get("state")=="authorized":
+            if self.authorization_store is None: raise GateControlError("authorization store is unavailable")
+            try: self.authorization_store.cancel(prior["authorization"]["authorization_id"],now=int(self.clock()))
+            except Exception as error: raise GateControlError(f"authorization cannot be revoked: {type(error).__name__}") from error
+            request=dict(prior); request["authorization"]=dict(prior["authorization"]); request["authorization"]["status"]="cancelled"; request["consumption_possible"]=False
+        else:
+            try:
+                request = self.backend.cancel_request(request_id, requester=prior["requester"])
+            except Exception:
+                request = dict(prior)
         request["state"] = "denied"
         request["updated_at"] = int(self.clock())
         self.ledger.record_request(request, event="denied", actor=actor)
