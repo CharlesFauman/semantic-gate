@@ -20,9 +20,9 @@ class FakeBackend:
     def explain_action(self, action, principal):
         return {"action":action,"execution_enabled":False}
 
-    def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key):
-        self.calls.append((action, requester, trusted_context))
-        request = {"request_id":f"req_{len(self.calls)}","request_hash":"h","action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"gates":[]}
+    def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key, minimum_control="policy"):
+        self.calls.append((action, requester, trusted_context, minimum_control))
+        request = {"request_id":f"req_{len(self.calls)}","request_hash":"h","action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"gates":[]}
         self.requests[request["request_id"]] = request
         return dict(request)
 
@@ -33,7 +33,7 @@ class FakeBackend:
         self.requests[request_id]["state"] = "cancelled"
         return dict(self.requests[request_id])
 
-    def approve_request(self, request_id, actor):
+    def approve_request(self, request_id, actor, assurance="ask"):
         self.requests[request_id]["state"] = "simulated"
         return dict(self.requests[request_id])
 
@@ -56,13 +56,21 @@ class GateControlTests(unittest.TestCase):
             host_context={"direct_user_request":False,"surface":"mcp"},
         )
         self.assertEqual("hermes-mac", result["requester"])
-        self.assertEqual(("home.tv.power_off", "hermes-mac", {"direct_user_request":False,"surface":"mcp"}), self.backend.calls[0])
+        self.assertEqual(("home.tv.power_off", "hermes-mac", {"direct_user_request":False,"surface":"mcp"}, "policy"), self.backend.calls[0])
         self.assertNotIn("trusted_context", result)
         self.assertEqual("waiting_for_approval", self.ledger.get_request(result["request_id"])["state"])
-        for forbidden in ("requester", "trusted_context"):
+        for forbidden in ("requester", "trusted_context", "mode", "approval", "required_control"):
             payload = {"action":"home.tv.power_off","parameters":{},"context":{},"idempotency_key":forbidden,forbidden:"forged"}
             with self.subTest(forbidden=forbidden), self.assertRaisesRegex(GateControlError, "unknown request field"):
                 self.control.request_action(principal="hermes-mac", payload=payload, host_context={})
+
+    def test_caller_can_only_supply_bounded_minimum_control_floor(self):
+        result=self.control.request_action(principal="hermes-mac",payload={"action":"home.tv.power_off","parameters":{},"context":{},"idempotency_key":"floor","minimum_control":"step_up"},host_context={})
+        self.assertEqual("step_up",result["minimum_control"])
+        self.assertEqual("step_up",self.backend.calls[-1][-1])
+        for invalid in ("allow",None,[],{}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(GateControlError,"minimum_control"):
+                self.control.request_action(principal="hermes-mac",payload={"action":"home.tv.power_off","parameters":{},"context":{},"idempotency_key":"bad","minimum_control":invalid},host_context={})
 
     def test_pause_domain_and_revoke_fail_before_backend(self):
         self.control.set_control("paused_domains", ["purchase"], actor="control-panel")

@@ -119,12 +119,13 @@ TOOLS = [
     },
     {
         "name": "request_action",
-        "description": "Propose an action. Semantic Gate runs eligible preconditions and stops at trusted human approval; this tool cannot approve itself.",
+        "description": "Propose an action. Semantic Gate decides required control; caller may set only a stricter floor. This tool cannot approve or execute.",
         "inputSchema": _object({
             "action": {"type": "string", "minLength": 1},
             "parameters": {"type": "object"},
             "context": {"type": "object"},
             "idempotency_key": {"type": "string", "minLength": 1},
+            "minimum_control": {"type":"string","enum":["policy","ask","step_up"],"default":"policy"},
         }, ["action", "parameters", "context", "idempotency_key"]),
         "annotations": {"readOnlyHint": False, "destructiveHint": False},
     },
@@ -166,7 +167,7 @@ class SemanticGateMCP:
             result = self.engine.explain_action(arguments["action"], principal=self.principal)
         elif name == "request_action":
             required = {"action", "parameters", "context", "idempotency_key"}
-            _require_args(arguments, required, required)
+            _require_args(arguments, required | {"minimum_control"}, required)
             result = self.engine.request_action(
                 action=arguments["action"],
                 parameters=arguments["parameters"],
@@ -174,6 +175,7 @@ class SemanticGateMCP:
                 trusted_context=self.trusted_context,
                 requester=self.principal,
                 idempotency_key=arguments["idempotency_key"],
+                minimum_control=arguments.get("minimum_control","policy"),
             )
         elif name == "get_request":
             _require_args(arguments, {"request_id"}, {"request_id"})

@@ -13,7 +13,8 @@ class GateControlError(ValueError):
 
 
 class GateControl:
-    REQUEST_FIELDS = {"action", "parameters", "context", "idempotency_key"}
+    REQUEST_REQUIRED_FIELDS = {"action", "parameters", "context", "idempotency_key"}
+    REQUEST_OPTIONAL_FIELDS = {"minimum_control"}
     OBSERVATION_FIELDS = {"event_id","phase","operation","semantic_class","outcome","occurred_at","metadata"}
     OBSERVATION_METADATA_KEYS = {"surface","node","harness","duration_ms","status","error_type","dropped_events","toolset","version"}
 
@@ -36,8 +37,8 @@ class GateControl:
     def _payload(payload: Mapping[str, Any]) -> dict:
         if not isinstance(payload, Mapping):
             raise GateControlError("request payload must be an object")
-        unknown = set(payload) - GateControl.REQUEST_FIELDS
-        missing = GateControl.REQUEST_FIELDS - set(payload)
+        unknown = set(payload) - GateControl.REQUEST_REQUIRED_FIELDS - GateControl.REQUEST_OPTIONAL_FIELDS
+        missing = GateControl.REQUEST_REQUIRED_FIELDS - set(payload)
         if unknown:
             raise GateControlError(f"unknown request field(s): {sorted(unknown)}")
         if missing:
@@ -48,7 +49,10 @@ class GateControl:
             raise GateControlError("parameters and context must be objects")
         if not isinstance(payload["idempotency_key"], str) or not payload["idempotency_key"]:
             raise GateControlError("idempotency_key must be a non-empty string")
-        return dict(payload)
+        minimum_control=payload.get("minimum_control","policy")
+        if not isinstance(minimum_control,str) or minimum_control not in {"policy","ask","step_up"}:
+            raise GateControlError("minimum_control must be policy, ask, or step_up")
+        return {**payload,"minimum_control":minimum_control}
 
     def list_actions(self, principal: str):
         return self.backend.list_actions(principal)
@@ -66,6 +70,7 @@ class GateControl:
             trusted_context=dict(host_context),
             requester=principal,
             idempotency_key=data["idempotency_key"],
+            minimum_control=data["minimum_control"],
         )
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
@@ -119,10 +124,12 @@ class GateControl:
         self.ledger.record_request(request, event="cancelled", actor=principal)
         return request
 
-    def approve(self, request_id: str, *, actor: str, actor_role: str):
+    def approve(self, request_id: str, *, actor: str, actor_role: str, assurance: str = "ask"):
         if actor_role != "admin":
             raise GateControlError("admin approval transport is required")
-        request = self.backend.approve_request(request_id, actor=actor)
+        if assurance not in {"ask","step_up"}:
+            raise GateControlError("approval assurance is invalid")
+        request = self.backend.approve_request(request_id, actor=actor, assurance=assurance)
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
         self.ledger.record_request(request, event="approved", actor=actor)

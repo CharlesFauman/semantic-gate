@@ -20,12 +20,14 @@ Semantic Gate borrows established security patterns rather than inventing an age
 1. The coordinator is a policy decision point; node brokers and plugins are enforcement points.
 2. An action request has a host-authenticated principal, semantic action, closed parameters, trusted host context and immutable request hash.
 3. Agents may propose, inspect and restrictively cancel. Human approval and execution are separate authorities.
-4. Credentials stay behind plugins. An agent sees a semantic action, not a vendor token.
-5. Local and remote execution use the same request and approval graph.
-6. Distributed execution uses a single-use, expiring lease bound to request, policy, node, plugin, action and parameter hash.
-7. Node plugins expose reviewed semantic recipes. They do not expose generic shell, AppleScript text, PowerShell text, GUI coordinates or arbitrary keystrokes.
-8. Deferred requests are durable, but restart behavior fails closed. The current coordinator expires unresolved snapshots rather than reviving them.
-9. A deployment must distinguish catalogued, shadowed and enforced actions. A gate is not an enforcement boundary while the agent retains direct credentials, shell access or raw downstream tools.
+4. Policy decides required control. A caller may request stricter review but
+   cannot lower, bypass or replace the policy-selected requirement.
+5. Credentials stay behind plugins. An agent sees a semantic action, not a vendor token.
+6. Local and remote execution use the same request and approval graph.
+7. Distributed execution uses a single-use, expiring lease bound to request, policy, node, plugin, action and parameter hash.
+8. Node plugins expose reviewed semantic recipes. They do not expose generic shell, AppleScript text, PowerShell text, GUI coordinates or arbitrary keystrokes.
+9. Deferred requests are durable, but restart behavior fails closed. The current coordinator expires unresolved snapshots rather than reviving them.
+10. A deployment must distinguish catalogued, shadowed and enforced actions. A gate is not an enforcement boundary while the agent retains direct credentials, shell access or raw downstream tools.
 
 ## Deliberate differences
 

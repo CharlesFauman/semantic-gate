@@ -22,6 +22,14 @@ access to the downstream effectful tools that Semantic Gate is meant to gate.
 13. Live execution requires both enforcing policy and host-owned authority.
 14. Target failures are terminal and are never automatically retried.
 15. Default MCP construction trusts no approval evidence and has no authority.
+16. The caller never selects permission mode. `minimum_control` may only raise
+    the effective approval requirement; policy remains authoritative and the
+    floor is request-hash/idempotency bound.
+17. Approval levels are closed to ordinary `ask` and `step_up`. Signed evidence
+    carries assurance and the engine rejects evidence below the effective
+    request control. The bundled password panel provides ordinary assurance;
+    deployments must use an independently authenticated stronger transport for
+    step-up.
 
 ## Host responsibilities
 
@@ -35,6 +43,9 @@ A production host must:
 - verify human approval through an independent authenticated surface;
 - bind approval to request hash, actor, decision and expiry;
 - persist request/evidence state transactionally if restart safety matters;
+- persist idempotency/replay bindings outside the process if callers require
+  them to survive restart; the bundled coordinator expires unresolved snapshots
+  and does not claim cross-restart idempotency;
 - protect against duplicate execution at the downstream adapter too;
 - redact sensitive parameters from logs and user-facing notifications;
 - constrain target adapter egress and credentials to least privilege;
@@ -83,8 +94,21 @@ Public JSON boundaries are intentionally bounded: signed 64-bit integers,
 64 KiB strings, 10,000-item collections, depth 64, 100,000 nodes, 256-character
 JSON-RPC string IDs and 1 MiB stdio messages. Hosts may impose tighter limits.
 
+## Supported versions
+
+| Version | Security support |
+|---|---|
+| `0.2.x` | Supported |
+| `< 0.2` | Not supported |
+
+Security fixes target the latest `0.2.x` release and current default branch.
+Users should upgrade to the newest patch before reporting a regression.
+
 ## Reporting vulnerabilities
 
-While the repository is private, report issues directly to the repository owner.
-Before public release, add a private GitHub security-advisory route and a
-supported-version policy.
+Do not open a public issue for a suspected vulnerability. Use GitHub’s private
+[Report a vulnerability](../../security/advisories/new) route for this
+repository. Include the affected version, impact, minimal reproduction and any
+suggested mitigation, but do not include live credentials or private deployment
+data. If the private advisory form is unavailable, contact a repository
+maintainer through the private account/channel that granted repository access.

@@ -41,6 +41,12 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual("expired", self.ledger.get_request("req_processing")["state"])
         self.assertEqual("simulated", self.ledger.get_request("req_done")["state"])
 
+    def test_restart_expiration_covers_more_than_one_page(self):
+        for index in range(750):
+            self.ledger.record_request({"request_id":f"bulk_{index:04d}","action":"x.y","requester":"agent","state":"waiting_for_approval","created_at":index},event="requested",actor="agent")
+        self.assertEqual(750,self.ledger.expire_unresolved(now=1000))
+        self.assertTrue(all(self.ledger.get_request(f"bulk_{index:04d}")["state"]=="expired" for index in range(750)))
+
     def test_pause_and_revocation_are_restrictive_and_persistent(self):
         self.ledger.set_control("pause_all", True, actor="control-panel", now=10)
         self.ledger.set_control("paused_domains", ["purchase", "communication"], actor="control-panel", now=11)

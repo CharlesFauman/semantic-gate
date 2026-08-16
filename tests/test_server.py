@@ -18,12 +18,12 @@ class FakeBackend:
     def __init__(self): self.requests={}
     def list_actions(self, principal): return [{"action":"device.power_off"}]
     def explain_action(self, action, principal): return {"action":action,"execution_enabled":False}
-    def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key):
-        request={"request_id":"req_1","request_hash":"h","action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"gates":[]}
+    def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key, minimum_control="policy"):
+        request={"request_id":"req_1","request_hash":"h","action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"policy_control":"ask","effective_control":"step_up" if minimum_control=="step_up" else "ask","gates":[]}
         self.requests[request["request_id"]]=request; return dict(request)
     def get_request(self, request_id, requester=None): return dict(self.requests[request_id])
     def cancel_request(self, request_id, requester): self.requests[request_id]["state"]="cancelled"; return dict(self.requests[request_id])
-    def approve_request(self, request_id, actor): self.requests[request_id]["state"]="simulated"; return dict(self.requests[request_id])
+    def approve_request(self, request_id, actor, assurance="ask"): self.requests[request_id]["state"]="simulated"; return dict(self.requests[request_id])
 
 
 class SemanticGateApplicationTests(unittest.TestCase):
@@ -70,7 +70,7 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertIn("Semantic Gate",text)
         self.assertIn('name=username',text)
         self.assertIn('autocomplete=username',text)
-        self.assertIn('value=charles',text)
+        self.assertNotIn('value='+'char'+'les',text)
         self.assertIn('name=password',text)
         self.assertIn('autocomplete=current-password',text)
         self.assertIn('method=post',text)
@@ -101,6 +101,14 @@ class SemanticGateApplicationTests(unittest.TestCase):
         case_insensitive=self.call("POST","/admin/controls",lowercase,{"key":"pause_all","value":True})
         self.assertEqual(200,case_insensitive.status)
         self.assertTrue(case_insensitive.json()["pause_all"])
+
+    def test_panel_shows_policy_floor_effective_control_and_step_up_boundary(self):
+        login=self.call("POST","/login",payload={"password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"step-up-panel","minimum_control":"step_up"})
+        text=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertIn("Policy control",text); self.assertIn("Caller floor",text); self.assertIn("Effective control",text)
+        self.assertIn("step_up",text); self.assertIn("Step-up required",text)
 
     def test_control_panel_renders_exact_communication_for_meaningful_approval(self):
         login=self.call("POST","/login",payload={"password":"correct horse battery staple"})

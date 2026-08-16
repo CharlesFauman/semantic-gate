@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "actions": {
+    "scm.git.fetch": {
+      "effect": "read",
+      "default_control": "audit",
+      "required_parameters": [
+        "repository_id",
+        "remote_id",
+        "refspec",
+        "expected_tracking_ref_before"
+      ],
+      "evidence_after": [
+        "tracking_ref_after",
+        "fetched_commit_ids"
+      ],
+      "invariants": [
+        "worktree_unchanged",
+        "no_remote_write"
+      ]
+    },
+    "scm.git.pull": {
+      "effect": "private_write",
+      "default_control": "ask",
+      "required_parameters": [
+        "repository_id",
+        "remote_id",
+        "branch_or_ref",
+        "integration_strategy",
+        "expected_local_ref_before",
+        "expected_upstream_ref",
+        "dirty_worktree_policy"
+      ],
+      "evidence_after": [
+        "local_ref_after",
+        "worktree_state_after"
+      ],
+      "invariants": [
+        "preserve_unrelated_work",
+        "no_force_reset"
+      ]
+    },
+    "scm.git.push": {
+      "effect": "external_write",
+      "default_control": "step_up",
+      "required_parameters": [
+        "repository_id",
+        "remote_id",
+        "refspec",
+        "expected_local_source_ref",
+        "expected_remote_destination_before",
+        "force_mode"
+      ],
+      "evidence_after": [
+        "remote_destination_after",
+        "remote_receipt"
+      ],
+      "invariants": [
+        "non_force_by_default",
+        "force_with_lease_only"
+      ]
+    }
+  },
+  "migration": {
+    "promotion_unit": "one_action",
+    "required_proof": [
+      "approved_brokered_operation_succeeds",
+      "direct_unapproved_operation_fails_without_remote_credential",
+      "before_and_after_refs_verified",
+      "pause_and_revocation_verified"
+    ]
+  }
+}
