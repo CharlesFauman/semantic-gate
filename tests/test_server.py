@@ -86,6 +86,32 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertEqual(200,case_insensitive.status)
         self.assertTrue(case_insensitive.json()["pause_all"])
 
+    def test_control_panel_renders_exact_communication_for_meaningful_approval(self):
+        login=self.call("POST","/login",payload={"password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        parameters={
+            "summary":"Email supplier before purchase",
+            "target":"support@example.test",
+            "details":{
+                "channel":"email",
+                "recipient":"support@example.test",
+                "subject":"Exact component confirmation",
+                "body":"Hello supplier,\nPlease confirm <exact> parts & warranty.",
+                "listing_id":"LIST-123",
+                "attachments":["requirements.pdf"],
+            },
+        }
+        self.call("POST","/api/v1/requests",self.agent,{"action":"communication.send","parameters":parameters,"context":{},"idempotency_key":"communication-review"})
+        text=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertIn("Review exact request",text)
+        self.assertIn("support@example.test",text)
+        self.assertIn("Exact component confirmation",text)
+        self.assertIn("Hello supplier,",text)
+        self.assertIn("Please confirm &lt;exact&gt; parts &amp; warranty.",text)
+        self.assertNotIn("Please confirm <exact> parts & warranty.",text)
+        self.assertIn("LIST-123",text)
+        self.assertIn("requirements.pdf",text)
+
     def test_http_json_rejects_non_finite_values(self):
         response=self.app.handle("POST","/api/v1/requests",self.agent,b'{"action":"device.power_off","parameters":{"x":NaN},"context":{},"idempotency_key":"nan"}')
         self.assertEqual(400,response.status)
