@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 
-def build_policy(catalog: Mapping[str, Any], principals: Mapping[str, Mapping[str, Any]]) -> dict:
+def build_policy(catalog: Mapping[str, Any], principals: Mapping[str, Mapping[str, Any]], *, authorization_audience: str = "semantic-gate-broker", authorization_ttl_seconds: int = 300, legacy_inline: bool = False) -> dict:
+    if not isinstance(authorization_audience,str) or not authorization_audience: raise ValueError("authorization_audience must be non-empty")
+    if type(authorization_ttl_seconds) is not int or authorization_ttl_seconds<1: raise ValueError("authorization_ttl_seconds must be positive")
+    if type(legacy_inline) is not bool: raise ValueError("legacy_inline must be boolean")
     allowed_principals = sorted(
         principal_id for principal_id, config in principals.items()
         if config.get("enabled") is True and config.get("role") in {"agent", "service", "admin"}
@@ -66,4 +69,6 @@ def build_policy(catalog: Mapping[str, Any], principals: Mapping[str, Mapping[st
                 },
             ],
         }
-    return {"version":1,"mode":"simulation_only","execution_enabled":False,"workflows":workflows}
+    policy={"version":1 if legacy_inline else 2,"mode":"simulation_only","execution_enabled":False,"workflows":workflows}
+    if not legacy_inline: policy["authorization"]={"audience":authorization_audience,"ttl_seconds":authorization_ttl_seconds}
+    return policy

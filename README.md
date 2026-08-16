@@ -12,9 +12,16 @@ API, local function, command broker, another MCP server, or any other host-owned
 capability. The optional coordinator service, direct HTTP client, mobile control
 panel and distributed node-broker/plugin SDK use the same semantic action model.
 
-Start extending with [`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md),
-which compares SDK, HTTP, MCP, observer, fixed-recipe and node-broker options and
-links runnable examples under `examples/integrations/`.
+Start with [`docs/QUICKSTART.md`](docs/QUICKSTART.md), then use
+[`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md) for SDK, HTTP, MCP,
+observer, fixed-recipe and node-broker options.
+
+Beta references:
+
+- [`docs/BETA.md`](docs/BETA.md) — acceptance criteria and non-claims;
+- [`docs/MIGRATING_TO_0_3.md`](docs/MIGRATING_TO_0_3.md) — version-1 migration and rollback;
+- [`docs/ED25519_APPROVALS.md`](docs/ED25519_APPROVALS.md) — enrolled public-key human approval;
+- [`docs/ADAPTER_HOST.md`](docs/ADAPTER_HOST.md) — strict existing-MCP mappings.
 
 ### Learn by running
 
@@ -50,10 +57,10 @@ guide, `make example-mcp-enforcing-mock` is an explicit opt-in proof that invoke
 only the bundled local mock target with a host-owned `ExecutionAuthority`; it
 does not contact a real external system.
 
-> **Status:** alpha. All default examples are simulation-only. The default MCP
-> server installs a deny-all approval verifier and no execution authority.
-> The coordinator added in v0.2 also generates simulation-only policy and expires
-> unresolved requests on restart; it does not claim crash-safe live execution.
+> **Status:** `0.3.0b1` beta. All default examples are simulation-only. Version-2
+> policies separate approval from execution: approval issues a signed, durable,
+> expiring authorization; a caller later chooses whether to submit its ID to a
+> fixed broker. Version-1 inline execution remains deprecated compatibility only.
 
 ## Why
 
@@ -82,8 +89,10 @@ normalize request
   → notify the human
   → wait for exact request-bound approval evidence
   → re-check time-sensitive conditions
-  → require host-owned execution authority
-  → call the registered target at most once in the locked in-memory process
+  → issue durable signed authorization
+  → caller independently chooses whether/when to consume
+  → broker re-checks, atomically reserves authorization and calls fixed target
+  → persist executed / failed / simulated / unknown outcome
 ```
 
 The model cannot skip a node, invent approval evidence, or call the target
@@ -98,7 +107,7 @@ through the gateway directly.
 - **Policy-owned control:** policy decides the required approval level. A caller
   may supply only `minimum_control=policy|ask|step_up`; this is a floor and can
   never reduce the policy-selected requirement.
-- **v0.1 schema scope:** scalar fields support bounds/enums; object and array
+- **Current schema scope:** scalar fields support bounds/enums; object and array
   fields are opaque JSON values rather than recursively validated.
 - **Bounded JSON domain:** inputs reject non-string object keys, non-JSON
   Python values, excessive nesting/collections/strings, and integers outside
@@ -108,14 +117,19 @@ through the gateway directly.
 - **Out-of-band approval:** approval ingestion is a host API, never an agent-callable MCP tool.
 - **Exact binding:** approval evidence is bound to request ID, request hash,
   approval-gate ID, unique evidence ID and expiry.
-- **TOCTOU protection:** enforcing workflows require a post-approval recheck
-  after every approval before execution.
-- **Idempotency:** keys are bound to exact canonical requests.
-- **In-process serialization:** concurrent approval callbacks cannot execute one request twice.
+- **TOCTOU protection:** workflows recheck after approval before authorization;
+  brokers recheck again immediately before target invocation.
+- **Durable idempotency:** coordinator idempotency bindings survive restart and
+  reject changed payload/context reuse.
+- **Single-use consumption:** SQLite atomically transitions authorization from
+  issued to executing before a target call; replay is rejected across restart.
+- **Unknown outcomes:** interrupted or timed-out target calls become `unknown`
+  and require explicit reconciliation rather than automatic retry.
 - **Notification binding:** delivery evidence is bound to request ID/hash, gate,
   recipient, template hash, delivery time and a unique notification ID.
 - **Separated tool roles:** read gates and effectful targets live in different registries.
-- **Dual execution control:** live execution needs policy enablement **and** a host-owned `ExecutionAuthority` object.
+- **Dual execution control:** live execution needs signed authorization, policy
+  enablement, a non-simulated exact gate and a broker-owned `ExecutionAuthority`.
 - **Safe MCP defaults:** the CLI MCP server has no trusted approval verifier or execution authority.
 
 ## Quick start
@@ -144,9 +158,10 @@ There is deliberately no MCP tool for approval ingestion or execution.
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "mode": "simulation_only",
   "execution_enabled": false,
+  "authorization": {"audience":"example-broker","ttl_seconds":300},
   "workflows": {
     "device.power_off": {
       "description": "Power off an allowlisted device after safety checks and approval.",
@@ -184,10 +199,12 @@ See [`examples/`](examples/) for calendar, purchase and device-control flows.
 - proposal-only MCP over HTTP;
 - a mobile control panel for simulation review;
 - SQLite request snapshots, audit events and emergency controls;
+- durable request idempotency and signed authorization records;
 - host-derived principal capabilities;
 - redacted credential-binding inventory.
 
-`SemanticGateClient` provides the same proposal contract without MCP. Local and
+The coordinator requires distinct master, approval and authorization keys; see
+the migration guide. `SemanticGateClient` provides the proposal contract without MCP. Local and
 remote execution plugins implement `ActionPlugin` and run behind `NodeBroker`.
 The broker accepts only signed, expiring, single-use leases addressed to an exact
 node, plugin, semantic action and canonical parameter hash.
@@ -217,22 +234,35 @@ See [`docs/PLUGINS.md`](docs/PLUGINS.md) and
 
 ```python
 from semantic_gate import (
+    AuthorizationBroker,
     ExecutionAuthority,
     GatewayEngine,
+    SQLiteAuthorizationStore,
     ToolRegistry,
     load_policy,
 )
 
 registry = ToolRegistry()
 registry.register_read("inventory.available", check_inventory)
-registry.register_target("commerce.place_order", place_order)
+store = SQLiteAuthorizationStore("authorization.sqlite3")
 
 engine = GatewayEngine(
     load_policy("private-workflow.json"),
     registry=registry,
     notifier=trusted_notifier,
     approval_verifier=trusted_out_of_band_verifier,
+    authorization_authority=private_authorization_signer,
+    authorization_store=store,
+)
+broker = AuthorizationBroker(
+    broker_id="commerce-broker",
+    authority=public_authorization_verifier,
+    store=store,
     execution_authority=ExecutionAuthority("production-host"),
+    revocation_checker=current_authorization_is_active,
+    expected_policy_hash=engine.policy_hash,
+    actions=fixed_action_map,
+    clock=clock,
 )
 ```
 
@@ -259,10 +289,10 @@ precondition is true.
 
 ## Public-readiness
 
-This repository is intentionally self-contained and uses no runtime dependencies.
+The core is dependency-free; Ed25519 support is an optional `approvals` extra.
 Examples contain placeholders only—no live URLs, credentials, account names,
 machine paths or private integration identifiers. Private consumers should keep
-their adapters private and contribute only generalized, simulation-only examples.
+their adapters private and contribute only generalized examples with no real effects.
 
 ## License
 

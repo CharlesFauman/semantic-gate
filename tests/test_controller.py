@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -95,6 +96,89 @@ class GateControlTests(unittest.TestCase):
         self.ledger.record_request(request,event="expired_on_restart",actor="system")
         result=self.control.get_request("old",principal="hermes-mac")
         self.assertEqual("expired",result["state"])
+
+    def test_request_idempotency_survives_backend_restart(self):
+        payload={"action":"home.tv.power_off","parameters":{"target":"living-room"},"context":{"surface":"test"},"idempotency_key":"durable"}
+        original=self.control.request_action(principal="hermes-mac",payload=payload,host_context={"node":"mac"})
+        class RestartedBackend(FakeBackend):
+            def request_action(self,**kwargs): raise AssertionError("backend must not be called for durable replay")
+        restarted=GateControl(RestartedBackend(),self.ledger,clock=lambda:101)
+        replay=restarted.request_action(principal="hermes-mac",payload=payload,host_context={"node":"mac"})
+        self.assertEqual(original["request_id"],replay["request_id"])
+        changed={**payload,"parameters":{"target":"other"}}
+        with self.assertRaisesRegex(GateControlError,"different request"):
+            restarted.request_action(principal="hermes-mac",payload=changed,host_context={"node":"mac"})
+
+    def test_request_idempotency_is_reserved_before_backend_callbacks(self):
+        second_ledger=Ledger(Path(self.tmp.name)/"ledger.sqlite3"); entered=threading.Event(); release=threading.Event()
+        class BlockingBackend(FakeBackend):
+            def request_action(self,**kwargs): entered.set(); release.wait(2); return super().request_action(**kwargs)
+        backend=BlockingBackend(); first=GateControl(backend,self.ledger,clock=lambda:100); second=GateControl(backend,second_ledger,clock=lambda:100)
+        payload={"action":"home.tv.power_off","parameters":{},"context":{},"idempotency_key":"atomic"}; outcomes=[]
+        thread=threading.Thread(target=lambda:outcomes.append(first.request_action(principal="hermes-mac",payload=payload,host_context={})))
+        thread.start(); self.assertTrue(entered.wait(1))
+        with self.assertRaisesRegex(GateControlError,"in progress"):
+            second.request_action(principal="hermes-mac",payload=payload,host_context={})
+        release.set(); thread.join(); self.assertEqual(1,len(backend.calls)); second_ledger.close()
+
+    def test_crash_after_idempotency_reservation_never_repeats_backend(self):
+        class CrashingBackend(FakeBackend):
+            def request_action(self,**kwargs): self.calls.append("attempted"); raise RuntimeError("crash after callback may have started")
+        payload={"action":"home.tv.power_off","parameters":{},"context":{},"idempotency_key":"crash"}; crashing=CrashingBackend(); control=GateControl(crashing,self.ledger,clock=lambda:100)
+        with self.assertRaises(RuntimeError): control.request_action(principal="hermes-mac",payload=payload,host_context={})
+        restarted=FakeBackend(); retry=GateControl(restarted,self.ledger,clock=lambda:101)
+        with self.assertRaisesRegex(GateControlError,"in progress"):
+            retry.request_action(principal="hermes-mac",payload=payload,host_context={})
+        self.assertEqual([],restarted.calls)
+
+    def test_persisted_authorization_can_be_revoked_after_backend_restart(self):
+        request={"request_id":"auth-request","request_hash":"h","action":"home.tv.power_off","requester":"hermes-mac","state":"authorized","created_at":1,"updated_at":2,"parameters":{},"context":{},"gates":[],"authorization":{"authorization_id":"auth-one","status":"issued"}}
+        self.ledger.record_request(request,event="authorized",actor="human")
+        class Store:
+            def __init__(self): self.cancelled=[]
+            def cancel(self,authorization_id,now): self.cancelled.append((authorization_id,now)); return {"state":"cancelled"}
+        store=Store(); restarted=GateControl(FakeBackend(),self.ledger,clock=lambda:10,authorization_store=store)
+        cancelled=restarted.cancel("auth-request",principal="hermes-mac")
+        self.assertEqual("cancelled",cancelled["state"]); self.assertEqual([("auth-one",10)],store.cancelled)
+        request["request_id"]="auth-deny"; request["state"]="authorized"; request["authorization"]["status"]="issued"
+        self.ledger.record_request(request,event="authorized",actor="human")
+        denied=restarted.deny("auth-deny",actor="admin",actor_role="admin")
+        self.assertEqual("denied",denied["state"]); self.assertEqual("cancelled",denied["authorization"]["status"])
+
+    def test_repeated_cancel_repairs_from_durable_cancelled_snapshot(self):
+        request={"request_id":"already-cancelled","request_hash":"h","action":"home.tv.power_off","requester":"hermes-mac","state":"cancelled","created_at":1,"updated_at":2,"parameters":{},"context":{},"gates":[],"consumption_possible":False,"authorization":{"authorization_id":"auth-one","status":"cancelled"}}
+        self.ledger.record_request(request,event="authorization_cancelled",actor="authorization-store")
+        class LostBackend(FakeBackend):
+            def cancel_request(self,*args,**kwargs): raise AssertionError("backend must not be called")
+        result=GateControl(LostBackend(),self.ledger,clock=lambda:10).cancel("already-cancelled",principal="hermes-mac")
+        self.assertEqual("cancelled",result["state"])
+
+    def test_pending_request_can_be_cancelled_after_backend_restart(self):
+        request={"request_id":"pending-restart","request_hash":"h","action":"home.tv.power_off","requester":"hermes-mac","state":"waiting_for_approval","created_at":1,"updated_at":2,"parameters":{},"context":{},"gates":[]}
+        self.ledger.record_request(request,event="requested",actor="hermes-mac")
+        class LostBackend(FakeBackend):
+            def cancel_request(self,*args,**kwargs): raise KeyError("process-local request lost")
+        cancelled=GateControl(LostBackend(),self.ledger,clock=lambda:10).cancel("pending-restart",principal="hermes-mac")
+        self.assertEqual("cancelled",cancelled["state"]); self.assertEqual("cancelled",self.ledger.get_request("pending-restart")["state"])
+
+    def test_request_reads_repair_stale_authorization_projection(self):
+        request={"request_id":"stale-auth","request_hash":"h","action":"home.tv.power_off","requester":"hermes-mac","state":"authorized","created_at":1,"updated_at":2,"parameters":{},"context":{},"gates":[],"consumption_possible":True,"authorization":{"authorization_id":"auth-stale","status":"issued"}}
+        self.ledger.record_request(request,event="authorized",actor="human")
+        class Store:
+            def get(self,authorization_id): return {"authorization_id":authorization_id,"state":"executed","receipt":{"order_id":"one"},"updated_at":9}
+        control=GateControl(FakeBackend(),self.ledger,clock=lambda:10,authorization_store=Store())
+        repaired=control.get_request("stale-auth",principal="hermes-mac")
+        self.assertEqual("executed",repaired["state"]); self.assertFalse(repaired["consumption_possible"])
+        self.assertEqual("executed",self.ledger.get_request("stale-auth")["state"])
+
+    def test_request_read_recovers_orphaned_authorization_snapshot(self):
+        waiting={"request_id":"orphan","request_hash":"h","action":"home.tv.power_off","requester":"hermes-mac","state":"waiting_for_approval","created_at":1,"updated_at":2,"parameters":{},"context":{},"gates":[]}
+        self.ledger.record_request(waiting,event="requested",actor="hermes-mac")
+        authorized={**waiting,"state":"authorized","updated_at":3,"consumption_possible":True,"authorization":{"authorization_id":"auth-orphan","status":"issued"}}
+        class Store:
+            def get_for_request(self,request_id): return {"state":"issued","updated_at":3,"receipt":None,"request_snapshot":authorized}
+        recovered=GateControl(FakeBackend(),self.ledger,clock=lambda:10,authorization_store=Store()).get_request("orphan",principal="hermes-mac")
+        self.assertEqual("authorized",recovered["state"]); self.assertEqual("auth-orphan",recovered["authorization"]["authorization_id"])
 
     def test_observation_identity_and_privacy_shape_are_host_enforced(self):
         payload={"event_id":"call-1:completed","phase":"completed","operation":"terminal","semantic_class":"compute.exec.arbitrary","outcome":"succeeded","occurred_at":99,"metadata":{"surface":"hermes","duration_ms":12}}

@@ -1,32 +1,139 @@
 {
-  "version": 1,
+  "version": 2,
   "mode": "simulation_only",
   "execution_enabled": false,
   "workflows": {
     "purchase.place_order": {
       "description": "Place an order only after inventory and budget checks, notification, exact approval and immediate inventory recheck.",
-      "principals": ["*"],
+      "principals": [
+        "*"
+      ],
       "target_tool": "commerce.place_order",
       "parameter_schema": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["sku", "quantity", "unit_price", "currency"],
+        "required": [
+          "sku",
+          "quantity",
+          "unit_price",
+          "currency"
+        ],
         "properties": {
-          "sku": {"type":"string","minLength":1},
-          "quantity": {"type":"integer","minimum":1},
-          "unit_price": {"type":"number","minimum":0},
-          "currency": {"type":"string","enum":["USD","EUR","GBP"]}
+          "sku": {
+            "type": "string",
+            "minLength": 1
+          },
+          "quantity": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "unit_price": {
+            "type": "number",
+            "minimum": 0
+          },
+          "currency": {
+            "type": "string",
+            "enum": [
+              "USD",
+              "EUR",
+              "GBP"
+            ]
+          }
         }
       },
       "gates": [
-        {"id":"schema","kind":"schema","requires":[]},
-        {"id":"inventory","kind":"tool","requires":["schema"],"tool":"inventory.available","input":{"sku":"$parameters.sku","quantity":"$parameters.quantity"},"expect":{"path":"available","op":"eq","value":true},"recheck":false},
-        {"id":"budget","kind":"tool","requires":["inventory"],"tool":"budget.within_limit","input":{"quantity":"$parameters.quantity","unit_price":"$parameters.unit_price","currency":"$parameters.currency"},"expect":{"path":"allowed","op":"eq","value":true},"recheck":false},
-        {"id":"notify","kind":"notify","requires":["budget"],"recipient":"human_owner","template":"Review purchase request"},
-        {"id":"approval","kind":"approval","requires":["notify"],"level":"human_step_up","ttl_seconds":180},
-        {"id":"recheck_inventory","kind":"tool","requires":["approval"],"tool":"inventory.available","input":{"sku":"$parameters.sku","quantity":"$parameters.quantity"},"expect":{"path":"available","op":"eq","value":true},"recheck":true},
-        {"id":"execute","kind":"execute","requires":["recheck_inventory"],"tool":"commerce.place_order","simulation_only":true}
+        {
+          "id": "schema",
+          "kind": "schema",
+          "requires": []
+        },
+        {
+          "id": "inventory",
+          "kind": "tool",
+          "requires": [
+            "schema"
+          ],
+          "tool": "inventory.available",
+          "input": {
+            "sku": "$parameters.sku",
+            "quantity": "$parameters.quantity"
+          },
+          "expect": {
+            "path": "available",
+            "op": "eq",
+            "value": true
+          },
+          "recheck": false
+        },
+        {
+          "id": "budget",
+          "kind": "tool",
+          "requires": [
+            "inventory"
+          ],
+          "tool": "budget.within_limit",
+          "input": {
+            "quantity": "$parameters.quantity",
+            "unit_price": "$parameters.unit_price",
+            "currency": "$parameters.currency"
+          },
+          "expect": {
+            "path": "allowed",
+            "op": "eq",
+            "value": true
+          },
+          "recheck": false
+        },
+        {
+          "id": "notify",
+          "kind": "notify",
+          "requires": [
+            "budget"
+          ],
+          "recipient": "human_owner",
+          "template": "Review purchase request"
+        },
+        {
+          "id": "approval",
+          "kind": "approval",
+          "requires": [
+            "notify"
+          ],
+          "level": "human_step_up",
+          "ttl_seconds": 180
+        },
+        {
+          "id": "recheck_inventory",
+          "kind": "tool",
+          "requires": [
+            "approval"
+          ],
+          "tool": "inventory.available",
+          "input": {
+            "sku": "$parameters.sku",
+            "quantity": "$parameters.quantity"
+          },
+          "expect": {
+            "path": "available",
+            "op": "eq",
+            "value": true
+          },
+          "recheck": true
+        },
+        {
+          "id": "execute",
+          "kind": "execute",
+          "requires": [
+            "recheck_inventory"
+          ],
+          "tool": "commerce.place_order",
+          "simulation_only": true
+        }
       ]
     }
+  },
+  "authorization": {
+    "audience": "example-broker",
+    "ttl_seconds": 300
   }
 }

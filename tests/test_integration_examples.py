@@ -96,7 +96,7 @@ class RunnableIntegrationTests(unittest.TestCase):
                 self.__class__.binary=(incoming is sys.stdin.buffer and outgoing is sys.stdout.buffer)
         class Stack:
             def close(self): pass
-        with mock.patch.object(adapter,"build_host",return_value=(object(),None,None,None,Stack())), mock.patch.object(adapter,"SemanticGateMCP",FakeMCP):
+        with mock.patch.object(adapter,"build_host",return_value=(object(),None,None,None,None,Stack())), mock.patch.object(adapter,"SemanticGateMCP",FakeMCP):
             adapter.serve()
         self.assertTrue(FakeMCP.binary)
 

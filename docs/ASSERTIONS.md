@@ -15,10 +15,12 @@ For accepted policy and host inputs, the core validates that:
 - execution depends on notification and approval;
 - notification evidence binds request ID/hash, gate, recipient and template;
 - approval evidence binds request ID/hash, approval gate, evidence ID, actor, assurance and expiry;
-- approval evidence is consumed once in the engine process;
-- enforcing workflows recheck mutable conditions after approval;
+- version-2 approval issues a signed target-bound authorization without calling a target;
+- authorization issue/consume/replay state is durable in SQLite;
+- enforcing workflows recheck after approval and again at broker consumption;
 - read tools and effectful target tools occupy separate registries;
-- live target invocation requires both enforcing policy and host-owned execution authority;
+- live target invocation requires an unexpired audience-bound token, fixed action
+  mapping, enforcing policy and broker-owned execution authority;
 - agent-callable MCP has no approval-ingestion or execution method.
 
 ## Host must assert
@@ -32,7 +34,7 @@ The embedding host is responsible for:
 - keeping target credentials out of agent reach;
 - removing direct shell/API/MCP/GUI bypasses;
 - making target operations idempotent or reconcilable;
-- persisting replay/idempotency state for the required restart lifetime;
+- protecting authorization signing keys and broker verification identities;
 - bounding network egress, subprocesses and outputs;
 - recording canonical audit state independently of chat projections;
 - verifying postconditions and unknown outcomes.
@@ -46,7 +48,7 @@ The library does not claim that:
 - a public key belongs to the intended person without host enrollment;
 - arbitrary adapter code is safe;
 - a downstream API completed when its response was lost;
-- process-local idempotency survives restart;
+- SQLite or downstream storage provides distributed consensus across replicas;
 - an agent cannot bypass the gate while it still holds raw credentials/tools;
 - simulation approval executed anything;
 - observation-only hooks enforce permission;

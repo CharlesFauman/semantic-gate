@@ -1,11 +1,10 @@
 # Integration guide
 
-Semantic Gate is a policy decision layer for semantic actions, not an agent
-workflow engine. Keep proposal, policy evaluation, trusted human evidence and
-target execution conceptually distinct. The bundled v0.2 engine nevertheless
-advances synchronously from trusted approval ingestion through rechecks to
-simulation or registered-target invocation; it has no durable intermediate
-authorization-consumption state.
+Semantic Gate is a permission plane for semantic actions, not an agent workflow
+engine. Version-2 policies keep proposal, policy evaluation, human evidence,
+authorization and target consumption distinct. Approval ends at `authorized`;
+the caller separately decides whether and when to submit the signed token to a
+fixed broker.
 
 ## Choose an integration option
 
@@ -36,21 +35,24 @@ effective step-up request. The bundled password panel intentionally provides
 only ordinary assurance; connect WebAuthn, a separately authenticated signed
 human channel, quorum, or another reviewed stronger transport for step-up.
 
-## Approval evidence and execution are distinct—but advancement is synchronous
+## Approval issues permission; it does not execute
 
-Human approval is exact request-bound evidence; it is not an agent-callable
-execution command. In the current bundled engine, however, trusted approval
-ingestion **synchronously advances** that same request through mandatory
-rechecks. A simulation workflow returns `simulated`; an enforcing workflow can
-then call its host-registered target and return `executed`, `blocked` or
-`failed`. There is no separately consumable `authorized` state in v0.2.
+For a version-2 policy, trusted approval ingestion runs mandatory post-approval
+checks and issues a signed authorization bound to request, action, target,
+parameters, policy, approval evidence, audience and expiry. It performs no
+target call. The requester may abandon or cancel the authorization, or later submit its
+non-secret ID to the addressed broker.
 
-The agent controls whether to propose a request and whether to propose later
-workflow steps. It cannot approve through MCP. The MCP surface does not expose approval ingestion to the agent. A host that needs approval and target
-consumption separated in time must add that orchestration boundary itself; it
-must not describe the bundled engine as providing one. Production hosts should
-keep credentials behind the registered target adapter and remove raw agent
-access before marking an action enforced.
+The broker loads and atomically reserves the host-stored record in SQLite, performs another mutable
+state recheck, and only then simulates or calls its fixed target. A repeated
+record is rejected across process restart. A timeout or ambiguous post-dispatch
+failure becomes `unknown`. A crashed process leaves `executing` reserved until
+an operator confirms abandonment and explicitly recovers it to `unknown`; that
+state requires explicit reconciliation and no state is automatically retried.
+Approval remains host-only and absent from agent MCP.
+
+Version-1 policies retain deprecated inline advancement solely for migration.
+New integrations should use version 2.
 
 ## Direct Python SDK
 
@@ -123,9 +125,9 @@ Keep generic workflow, engine, SDK, MCP, broker and plugin abstractions in this 
 - adapter owns credential/effect;
 - raw bypass denied;
 - request/authorization replay protected across the required lifetime;
-- cross-restart idempotency persisted by the host when required (the bundled
-  coordinator expires unresolved snapshots but does not persist engine
-  idempotency maps);
+- coordinator request idempotency persists across restart;
+- broker authorization consumption and replay state persist across restart;
+- unknown outcomes have an operator reconciliation procedure;
 - post-approval mutable state rechecked;
 - target idempotency or reconciliation defined;
 - no automatic retry after unknown outcome;

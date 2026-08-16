@@ -20,6 +20,8 @@ class Ledger:
         self._db.executescript("""
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
+        PRAGMA synchronous=FULL;
+        PRAGMA busy_timeout=5000;
         CREATE TABLE IF NOT EXISTS requests (
           request_id TEXT PRIMARY KEY,
           action TEXT NOT NULL,
@@ -56,7 +58,18 @@ class Ledger:
           updated_at INTEGER NOT NULL,
           actor TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS request_idempotency (
+          principal TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          fingerprint TEXT NOT NULL,
+          request_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'complete',
+          PRIMARY KEY(principal,idempotency_key)
+        );
         """)
+        columns={row[1] for row in self._db.execute("PRAGMA table_info(request_idempotency)")}
+        if "status" not in columns: self._db.execute("ALTER TABLE request_idempotency ADD COLUMN status TEXT NOT NULL DEFAULT 'complete'")
         self._db.commit()
 
     @staticmethod
@@ -91,11 +104,71 @@ class Ledger:
             row = self._db.execute("SELECT snapshot_json FROM requests WHERE request_id=?", (request_id,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def compare_and_swap_request(self,*,expected: dict,replacement: dict,event: str,actor: str) -> bool:
+        if expected.get("request_id")!=replacement.get("request_id"): raise ValueError("request projection IDs differ")
+        request_id=replacement["request_id"]; at=int(replacement.get("updated_at",replacement.get("created_at",0)))
+        with self._lock,self._db:
+            changed=self._db.execute("UPDATE requests SET state=?,updated_at=?,snapshot_json=? WHERE request_id=? AND snapshot_json=?",(replacement["state"],at,self._json(replacement),request_id,self._json(expected))).rowcount
+            if changed:
+                self._db.execute("INSERT INTO audit(request_id,event,actor,at,metadata_json) VALUES(?,?,?,?,?)",(request_id,event,actor,at,self._json({}))); self._prune_audit_locked()
+        return changed==1
+
     def list_requests(self, *, limit: int = 100) -> list[dict]:
         limit = max(1, min(int(limit), 500))
         with self._lock:
             rows = self._db.execute("SELECT snapshot_json FROM requests ORDER BY updated_at DESC, request_id DESC LIMIT ?", (limit,)).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def record_idempotency(self,*,principal: str,idempotency_key: str,fingerprint: str,request_id: str,now: int) -> str:
+        values=(principal,idempotency_key,fingerprint,request_id)
+        if any(not isinstance(item,str) or not item for item in values): raise ValueError("idempotency binding fields must be non-empty strings")
+        with self._lock,self._db:
+            row=self._db.execute("SELECT fingerprint,request_id FROM request_idempotency WHERE principal=? AND idempotency_key=?",(principal,idempotency_key)).fetchone()
+            if row:
+                if row["fingerprint"]!=fingerprint or row["request_id"]!=request_id: raise ValueError("conflicting idempotency binding")
+                return row["request_id"]
+            self._db.execute("INSERT INTO request_idempotency(principal,idempotency_key,fingerprint,request_id,created_at,status) VALUES(?,?,?,?,?,'complete')",(principal,idempotency_key,fingerprint,request_id,int(now)))
+        return request_id
+
+    def get_idempotency(self,*,principal: str,idempotency_key: str,fingerprint: str) -> str|None:
+        with self._lock:
+            row=self._db.execute("SELECT fingerprint,request_id,status FROM request_idempotency WHERE principal=? AND idempotency_key=?",(principal,idempotency_key)).fetchone()
+        if not row: return None
+        if row["fingerprint"]!=fingerprint: raise ValueError("idempotency key was used for a different request")
+        if row["status"]!="complete": raise ValueError("idempotency request is in progress; operator recovery is required")
+        return row["request_id"]
+
+    def reserve_idempotency(self,*,principal: str,idempotency_key: str,fingerprint: str,now: int) -> str|None:
+        values=(principal,idempotency_key,fingerprint)
+        if any(not isinstance(item,str) or not item for item in values): raise ValueError("idempotency reservation fields must be non-empty strings")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row=self._db.execute("SELECT fingerprint,request_id,status FROM request_idempotency WHERE principal=? AND idempotency_key=?",(principal,idempotency_key)).fetchone()
+                if row:
+                    if row["fingerprint"]!=fingerprint: raise ValueError("idempotency key was used for a different request")
+                    if row["status"]!="complete": raise ValueError("idempotency request is in progress; operator recovery is required")
+                    self._db.commit(); return row["request_id"]
+                self._db.execute("INSERT INTO request_idempotency(principal,idempotency_key,fingerprint,request_id,created_at,status) VALUES(?,?,?,?,?,'reserved')",(principal,idempotency_key,fingerprint,"",int(now)))
+                self._db.commit(); return None
+            except Exception:
+                if self._db.in_transaction: self._db.rollback()
+                raise
+
+    def complete_reserved_request(self,request: dict,*,principal: str,idempotency_key: str,fingerprint: str,event: str,actor: str) -> None:
+        request_id=request["request_id"]; at=int(request.get("updated_at",request.get("created_at",0)))
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row=self._db.execute("SELECT fingerprint,status FROM request_idempotency WHERE principal=? AND idempotency_key=?",(principal,idempotency_key)).fetchone()
+                if not row or row["fingerprint"]!=fingerprint or row["status"]!="reserved": raise ValueError("idempotency reservation is unavailable")
+                self._db.execute("INSERT INTO requests(request_id,action,requester,state,created_at,updated_at,snapshot_json) VALUES(?,?,?,?,?,?,?)",(request_id,request["action"],request["requester"],request["state"],int(request["created_at"]),at,self._json(request)))
+                self._db.execute("INSERT INTO audit(request_id,event,actor,at,metadata_json) VALUES(?,?,?,?,?)",(request_id,event,actor,at,self._json({})))
+                self._db.execute("UPDATE request_idempotency SET request_id=?,status='complete' WHERE principal=? AND idempotency_key=?",(request_id,principal,idempotency_key))
+                self._prune_audit_locked(); self._db.commit()
+            except Exception:
+                if self._db.in_transaction: self._db.rollback()
+                raise
 
     def audit_events(self, request_id: str | None = None, *, limit: int = 500) -> list[dict]:
         limit = max(1, min(int(limit), 1000))
@@ -156,7 +229,7 @@ class Ledger:
         return dict(observation)
 
     def expire_unresolved(self, *, now: int) -> int:
-        terminal = {"blocked", "cancelled", "simulated", "executed", "failed", "expired", "denied"}
+        terminal = {"blocked", "cancelled", "simulated", "executed", "failed", "expired", "denied", "authorized", "consuming", "outcome_unknown"}
         with self._lock:
             rows=self._db.execute("SELECT snapshot_json FROM requests ORDER BY updated_at DESC").fetchall()
         count = 0
