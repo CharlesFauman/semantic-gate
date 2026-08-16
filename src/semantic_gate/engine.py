@@ -188,6 +188,28 @@ def _copy(value: Any) -> Any:
         raise GatePolicyError(f"value must be JSON-serializable: {error}") from error
 
 
+CONTROL_RANK = {"ask": 1, "step_up": 2}
+
+
+def _effective_workflow(workflow: Mapping[str, Any], minimum_control: str) -> tuple[dict, str, str]:
+    if not isinstance(minimum_control,str) or minimum_control not in {"policy", "ask", "step_up"}:
+        raise GatePolicyError("minimum_control must be policy, ask, or step_up")
+    effective = _copy(workflow)
+    approvals = [gate for gate in effective["gates"] if gate["kind"] == "approval"]
+    if not approvals:
+        raise GatePolicyError("workflow has no approval gate to satisfy minimum_control")
+    policy_rank = max(2 if gate["level"] == "human_step_up" else 1 for gate in approvals)
+    requested_rank = policy_rank if minimum_control == "policy" else CONTROL_RANK[minimum_control]
+    effective_rank = max(policy_rank, requested_rank)
+    if effective_rank == 2:
+        for gate in approvals:
+            gate["level"] = "human_step_up"
+            gate["ttl_seconds"] = min(gate["ttl_seconds"], 300)
+    policy_control = "step_up" if policy_rank == 2 else "ask"
+    effective_control = "step_up" if effective_rank == 2 else "ask"
+    return effective, policy_control, effective_control
+
+
 def _canonical(value: Any) -> str:
     _validate_json_value(value)
     try:
@@ -403,7 +425,7 @@ def _validate_gate_fields(action: str, gate: Mapping[str, Any]) -> None:
     ):
         raise GatePolicyError(f"workflow {action} notification recipient/template must be non-empty")
     if kind == "approval":
-        if not isinstance(gate["level"], str) or not gate["level"] or type(gate["ttl_seconds"]) is not int or gate["ttl_seconds"] < 1:
+        if gate["level"] not in {"human_approve_once","human_step_up"} or type(gate["ttl_seconds"]) is not int or gate["ttl_seconds"] < 1:
             raise GatePolicyError(f"workflow {action} approval gate is invalid")
     if kind == "execute" and (not isinstance(gate["tool"], str) or not isinstance(gate["simulation_only"], bool)):
         raise GatePolicyError(f"workflow {action} execute gate is invalid")
@@ -597,6 +619,7 @@ class GatewayEngine:
         self.execution_authority = execution_authority
         self.clock = clock or (lambda: int(time.time()))
         self._requests: dict[str, dict] = {}
+        self._request_workflows: dict[str, dict] = {}
         self._idempotency: dict[tuple[str, str], tuple[str, str]] = {}
         self._consumed_approval_ids: set[str] = set()
         self._consumed_notification_ids: set[str] = set()
@@ -615,6 +638,10 @@ class GatewayEngine:
     @staticmethod
     def _principal_allowed(workflow: Mapping[str, Any], principal: str) -> bool:
         return "*" in workflow["principals"] or principal in workflow["principals"]
+
+    def _release_terminal_workflow(self, request: Mapping[str, Any]) -> None:
+        if request.get("state") in self.TERMINAL:
+            self._request_workflows.pop(str(request.get("request_id")),None)
 
     def list_actions(self, *, principal: str | None = None) -> list[dict]:
         if principal is not None and (not isinstance(principal, str) or not principal):
@@ -661,12 +688,14 @@ class GatewayEngine:
         trusted_context: Mapping[str, Any],
         requester: str,
         idempotency_key: str,
+        minimum_control: str = "policy",
     ) -> dict:
         if not isinstance(action, str) or not action:
             raise GatePolicyError("action must be a non-empty string")
-        workflow = self.policy["workflows"].get(action)
-        if workflow is None:
+        policy_workflow = self.policy["workflows"].get(action)
+        if policy_workflow is None:
             raise GatePolicyError(f"action is not requestable: {action}")
+        workflow, policy_control, effective_control = _effective_workflow(policy_workflow, minimum_control)
         if not isinstance(context, Mapping):
             raise GatePolicyError("context must be an object")
         if not isinstance(trusted_context, Mapping):
@@ -684,6 +713,9 @@ class GatewayEngine:
             "trusted_context": _copy(trusted_context),
             "requester": requester,
             "idempotency_key": idempotency_key,
+            "minimum_control": minimum_control,
+            "policy_control": policy_control,
+            "effective_control": effective_control,
             "workflow": workflow,
         }
         request_hash = hashlib.sha256(_canonical(canonical_body).encode("utf-8")).hexdigest()
@@ -706,6 +738,9 @@ class GatewayEngine:
             "trusted_context": _copy(trusted_context),
             "requester": requester,
             "idempotency_key": idempotency_key,
+            "minimum_control": minimum_control,
+            "policy_control": policy_control,
+            "effective_control": effective_control,
             "state": "processing",
             "blocked_by": None,
             "notification_delivered": False,
@@ -717,8 +752,10 @@ class GatewayEngine:
             ],
         }
         self._requests[request_id] = request
+        self._request_workflows[request_id] = workflow
         self._idempotency[idempotency] = (request_hash, request_id)
         self._advance(request, workflow)
+        self._release_terminal_workflow(request)
         return self.get_request(request_id)
 
     @_synchronized
@@ -761,6 +798,7 @@ class GatewayEngine:
         if request["state"] in self.TERMINAL:
             raise GatePolicyError("terminal request cannot be cancelled")
         request["state"] = "cancelled"
+        self._release_terminal_workflow(request)
         return self.get_request(request_id)
 
     @_synchronized
@@ -792,12 +830,18 @@ class GatewayEngine:
         expires_at = evidence.get("expires_at")
         if type(expires_at) is not int or expires_at <= self.clock():
             raise ApprovalRejected("approval evidence is expired")
-        workflow = self.policy["workflows"][request["action"]]
+        workflow = self._request_workflows[request_id]
         approval_definition = next(gate for gate in workflow["gates"] if gate["id"] == approval["id"])
         if expires_at > self.clock() + approval_definition["ttl_seconds"]:
             raise ApprovalRejected("approval expiry exceeds the gate TTL")
         if not isinstance(evidence.get("actor"), str) or not evidence["actor"]:
             raise ApprovalRejected("approval actor is missing")
+        assurance=evidence.get("assurance")
+        if assurance not in {"ask","step_up"}:
+            raise ApprovalRejected("approval assurance is missing or invalid")
+        required="step_up" if approval_definition["level"]=="human_step_up" else "ask"
+        if CONTROL_RANK[assurance] < CONTROL_RANK[required]:
+            raise ApprovalRejected("approval assurance is below the required control")
         try:
             with self._callback_scope(request_id):
                 trusted = self.approval_verifier.verify(_copy(evidence), self.get_request(request_id))
@@ -813,12 +857,14 @@ class GatewayEngine:
             "request_id": request["request_id"],
             "actor": evidence["actor"],
             "decision": "approve",
+            "assurance": assurance,
             "request_hash": request["request_hash"],
             "expires_at": expires_at,
             "consumed_at": self.clock(),
         }
         request["state"] = "processing"
         self._advance(request, workflow)
+        self._release_terminal_workflow(request)
         return self.get_request(request_id)
 
     def _advance(self, request: dict, workflow: Mapping[str, Any]) -> None:

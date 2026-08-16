@@ -157,8 +157,11 @@ class Ledger:
 
     def expire_unresolved(self, *, now: int) -> int:
         terminal = {"blocked", "cancelled", "simulated", "executed", "failed", "expired", "denied"}
+        with self._lock:
+            rows=self._db.execute("SELECT snapshot_json FROM requests ORDER BY updated_at DESC").fetchall()
         count = 0
-        for request in self.list_requests(limit=500):
+        for row in rows:
+            request=json.loads(row["snapshot_json"])
             if request["state"] in terminal:
                 continue
             request["state"] = "expired"

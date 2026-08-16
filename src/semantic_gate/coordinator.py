@@ -28,7 +28,12 @@ class HostApprovalVerifier:
 
     def verify(self, evidence: dict, request: dict) -> bool:
         supplied = evidence.get("signature")
-        return isinstance(supplied, str) and hmac.compare_digest(supplied, self.sign(evidence))
+        assurance=evidence.get("assurance")
+        required=request.get("effective_control","ask")
+        ranks={"ask":1,"step_up":2}
+        return (isinstance(supplied,str) and assurance in ranks and required in ranks
+                and ranks[assurance]>=ranks[required]
+                and hmac.compare_digest(supplied,self.sign(evidence)))
 
 
 class CoreBackend:
@@ -69,7 +74,9 @@ class CoreBackend:
     def cancel_request(self, request_id: str, requester: str):
         return self.engine.cancel_request(request_id, requester=requester)
 
-    def approve_request(self, request_id: str, actor: str):
+    def approve_request(self, request_id: str, actor: str, assurance: str = "ask"):
+        if assurance not in {"ask","step_up"}:
+            raise ApprovalRejected("approval assurance is invalid")
         request = self.engine.get_request(request_id)
         approval = next(
             gate for gate in request["gates"]
@@ -83,6 +90,7 @@ class CoreBackend:
             "approval_gate_id": approval["id"],
             "actor": actor,
             "decision": "approve",
+            "assurance": assurance,
             "expires_at": int(self.clock()) + ttl,
         }
         evidence["signature"] = self.verifier.sign(evidence)

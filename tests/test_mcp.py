@@ -49,6 +49,8 @@ class SemanticGateMCPTests(unittest.TestCase):
         self.assertNotIn("approve", " ".join(names))
         self.assertNotIn("execute", " ".join(names))
         self.assertTrue(all(tool["annotations"]["destructiveHint"] is False for tool in tools))
+        request_tool=next(tool for tool in tools if tool["name"]=="request_action")
+        self.assertEqual(["policy","ask","step_up"],request_tool["inputSchema"]["properties"]["minimum_control"]["enum"])
 
     def test_request_via_mcp_stops_at_human_approval(self):
         result = self.call("tools/call", {
@@ -61,6 +63,7 @@ class SemanticGateMCPTests(unittest.TestCase):
                 },
                 "context": {"channel":"example-chat","direct_user_request":False},
                 "idempotency_key": "mcp-calendar-1",
+                "minimum_control": "step_up",
             },
         })["result"]
         payload = json.loads(result["content"][0]["text"])
@@ -68,6 +71,8 @@ class SemanticGateMCPTests(unittest.TestCase):
         self.assertEqual("test-principal", payload["requester"])
         self.assertFalse(payload["execution_possible"])
         self.assertFalse(payload["notification_delivered"])
+        self.assertEqual("step_up",payload["minimum_control"])
+        self.assertEqual("step_up",payload["effective_control"])
 
     def test_agent_cannot_supply_or_override_requester_identity(self):
         response = self.call("tools/call", {

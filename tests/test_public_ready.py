@@ -18,7 +18,7 @@ class PublicReadinessTests(unittest.TestCase):
         forbidden_fragments = ("/Users/", "/home/", "http://", "https://", ".local", ".internal")
         credential_fields = ("api_key", "password", "private_key", "access_token", "secret")
         for path in (ROOT / "examples").rglob("*"):
-            if not path.is_file() or path.suffix.lower() not in {".md", ".json", ".yml", ".yaml"}:
+            if not path.is_file() or path.suffix.lower() not in {".md", ".json", ".yml", ".yaml", ".py"}:
                 continue
             text = path.read_text(errors="replace")
             lowered = text.casefold()
@@ -28,6 +28,23 @@ class PublicReadinessTests(unittest.TestCase):
             for field in credential_fields:
                 self.assertNotIn(f'"{field}"', lowered, f"credential field {field!r} in {path.relative_to(ROOT)}")
         self.assertTrue(checked)
+
+    def test_integration_guide_and_examples_cover_extension_options(self):
+        guide=(ROOT/"docs/INTEGRATION_GUIDE.md").read_text()
+        readme=(ROOT/"README.md").read_text()
+        required=(
+            "Direct Python SDK","HTTP API","MCP","Content-free observer",
+            "RecipePlugin","NodeBroker","minimum_control","Policy decides",
+            "approval is not execution","Private deployment boundary",
+        )
+        for value in required: self.assertIn(value,guide)
+        self.assertIn("docs/INTEGRATION_GUIDE.md",readme)
+        examples=ROOT/"examples/integrations"
+        expected={"sdk_request.py","http_request.py","observer.py","recipe_plugin.py","mcp-request.json","git-actions.json"}
+        self.assertTrue(expected <= {path.name for path in examples.iterdir()})
+        self.assertIn("Git fetch/pull/push example",guide)
+        for path in examples.glob("*.py"):
+            subprocess.run([sys.executable,"-m","py_compile",str(path)],check=True,cwd=ROOT)
 
     def test_all_example_workflows_are_valid_and_simulation_only(self):
         workflows = sorted((ROOT / "examples").glob("*/workflow.json"))
@@ -45,6 +62,13 @@ class PublicReadinessTests(unittest.TestCase):
             text = path.read_text(errors="replace").casefold()
             for value in forbidden:
                 self.assertNotIn(value.casefold(), text, f"private identifier {value!r} in {path.relative_to(ROOT)}")
+        self.assertNotIn("value="+"char"+"les",(ROOT/"src/semantic_gate/server.py").read_text().casefold())
+
+    def test_security_policy_has_actionable_reporting_and_supported_versions(self):
+        policy=(ROOT/"SECURITY.md").read_text()
+        self.assertIn("## Supported versions",policy)
+        self.assertIn("../../security/advisories/new",policy)
+        self.assertNotIn("Before public release",policy)
 
     def test_no_tracked_secrets_or_environment_files(self):
         completed = subprocess.run(["git","ls-files"],cwd=ROOT,text=True,capture_output=True,check=True)

@@ -1,0 +1,20 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "request_action",
+    "arguments": {
+      "action": "calendar.create_event",
+      "parameters": {
+        "title": "Example",
+        "provider": "Example",
+        "start": "2030-01-10T10:00:00Z",
+        "end": "2030-01-10T10:30:00Z"
+      },
+      "context": {"surface": "example-mcp"},
+      "idempotency_key": "example-mcp-calendar-1",
+      "minimum_control": "step_up"
+    }
+  }
+}

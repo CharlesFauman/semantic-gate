@@ -12,6 +12,10 @@ API, local function, command broker, another MCP server, or any other host-owned
 capability. The optional coordinator service, direct HTTP client, mobile control
 panel and distributed node-broker/plugin SDK use the same semantic action model.
 
+Start extending with [`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md),
+which compares SDK, HTTP, MCP, observer, fixed-recipe and node-broker options and
+links runnable examples under `examples/integrations/`.
+
 > **Status:** alpha. All bundled examples are simulation-only. The default MCP
 > server installs a deny-all approval verifier and no execution authority.
 > The coordinator added in v0.2 also generates simulation-only policy and expires
@@ -43,6 +47,9 @@ through the gateway directly.
 - **Principal allowlists:** each action declares which host-authenticated agent identities may propose it.
 - **Trusted context:** security-relevant facts are injected by the host and cannot be supplied through MCP.
 - **Closed schemas:** unknown parameters and unknown actions fail closed.
+- **Policy-owned control:** policy decides the required approval level. A caller
+  may supply only `minimum_control=policy|ask|step_up`; this is a floor and can
+  never reduce the policy-selected requirement.
 - **v0.1 schema scope:** scalar fields support bounds/enums; object and array
   fields are opaque JSON values rather than recursively validated.
 - **Bounded JSON domain:** inputs reject non-string object keys, non-JSON

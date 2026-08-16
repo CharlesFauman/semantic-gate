@@ -128,6 +128,7 @@ def approval_for(request: dict, *, expires_at: int = 1_700_000_300, approval_gat
         "evidence_id": f"evidence-{request['request_id']}-{gate_id}",
         "actor": "test-human",
         "decision": "approve",
+        "assurance": request.get("effective_control","step_up"),
         "request_id": request["request_id"],
         "request_hash": request["request_hash"],
         "approval_gate_id": gate_id,
@@ -156,7 +157,7 @@ class SemanticGateEngineTests(unittest.TestCase):
             clock=self.clock,
         )
 
-    def request(self, **changes) -> dict:
+    def request(self, minimum_control="policy", **changes) -> dict:
         parameters = {
             "title": "Example appointment",
             "provider": "Example provider",
@@ -171,7 +172,59 @@ class SemanticGateEngineTests(unittest.TestCase):
             trusted_context={"direct_user_request": True},
             requester="example-agent",
             idempotency_key="calendar-request-1",
+            minimum_control=minimum_control,
         )
+
+    def test_policy_owns_control_and_caller_floor_can_only_escalate(self):
+        policy_request=self.request()
+        self.assertEqual("step_up",policy_request["policy_control"])
+        self.assertEqual("policy",policy_request["minimum_control"])
+        self.assertEqual("step_up",policy_request["effective_control"])
+
+        ask_floor=self.engine.request_action(
+            action="calendar.create_event",
+            parameters={"title":"Example","provider":"Example","start":"2030-01-10T10:00:00Z","end":"2030-01-10T10:30:00Z"},
+            context={},trusted_context={"direct_user_request":True},requester="example-agent",idempotency_key="ask-floor",minimum_control="ask",
+        )
+        self.assertEqual("step_up",ask_floor["policy_control"])
+        self.assertEqual("ask",ask_floor["minimum_control"])
+        self.assertEqual("step_up",ask_floor["effective_control"])
+
+        weaker=json.loads(json.dumps(self.policy)); approval=next(g for g in weaker["workflows"]["calendar.create_event"]["gates"] if g["kind"]=="approval")
+        approval["level"]="human_approve_once"; approval["ttl_seconds"]=600
+        engine=GatewayEngine(load_policy(weaker),registry=self.registry,notifier=self.notifier,clock=self.clock)
+        escalated=engine.request_action(
+            action="calendar.create_event",parameters={"title":"Example","provider":"Example","start":"2030-01-10T10:00:00Z","end":"2030-01-10T10:30:00Z"},
+            context={},trusted_context={"direct_user_request":True},requester="example-agent",idempotency_key="step-up-floor",minimum_control="step_up",
+        )
+        self.assertEqual("ask",escalated["policy_control"])
+        self.assertEqual("step_up",escalated["effective_control"])
+        self.assertEqual("human_approve_once",next(g for g in weaker["workflows"]["calendar.create_event"]["gates"] if g["kind"]=="approval")["level"])
+        with self.assertRaisesRegex(ApprovalRejected,"TTL"):
+            engine.ingest_trusted_approval(escalated["request_id"],approval_for(escalated,expires_at=self.clock.now+600))
+
+    def test_minimum_control_is_bounded_and_idempotency_bound(self):
+        for invalid in ("allow",None,[],{}):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(GatePolicyError,"minimum_control"):
+                self.engine.request_action(action="calendar.create_event",parameters={},context={},trusted_context={},requester="example-agent",idempotency_key="bad-floor",minimum_control=invalid)
+        first=self.request(minimum_control="ask")
+        with self.assertRaisesRegex(GatePolicyError,"idempotency key"):
+            self.engine.request_action(
+                action="calendar.create_event",parameters=first["parameters"],context=first["context"],trusted_context={"direct_user_request":True},
+                requester="example-agent",idempotency_key="calendar-request-1",minimum_control="step_up",
+            )
+
+    def test_policy_approval_level_is_closed_and_unknown_level_fails(self):
+        malformed=json.loads(json.dumps(self.policy))
+        next(g for g in malformed["workflows"]["calendar.create_event"]["gates"] if g["kind"]=="approval")["level"]="human_super_admin"
+        with self.assertRaisesRegex(GatePolicyError,"approval gate"):
+            load_policy(malformed)
+
+    def test_terminal_requests_release_effective_workflow_state(self):
+        request=self.request()
+        self.assertIn(request["request_id"],self.engine._request_workflows)
+        self.engine.cancel_request(request["request_id"],requester="example-agent")
+        self.assertNotIn(request["request_id"],self.engine._request_workflows)
 
     def test_every_execute_path_depends_on_notification_and_approval(self):
         for action, workflow in self.policy["workflows"].items():
@@ -488,7 +541,7 @@ class SemanticGateEngineTests(unittest.TestCase):
         execute = workflow["gates"].pop()
         workflow["gates"].append({
             "id": "approval_2", "kind": "approval", "requires": ["recheck_terms"],
-            "level": "second_human_step_up", "ttl_seconds": 300,
+            "level": "human_step_up", "ttl_seconds": 300,
         })
         workflow["gates"].append({
             "id": "recheck_after_approval_2", "kind": "tool", "requires": ["approval_2"],

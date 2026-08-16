@@ -5,6 +5,7 @@ import unittest
 
 from semantic_gate.catalog import build_policy
 from semantic_gate.coordinator import CoreBackend
+from semantic_gate.engine import ApprovalRejected
 
 
 class CoreBackendTests(unittest.TestCase):
@@ -30,6 +31,14 @@ class CoreBackendTests(unittest.TestCase):
         self.assertEqual("simulated", approved["state"])
         self.assertFalse(approved["execution_possible"])
         self.assertEqual("semantic.action.home.tv.power_off", approved["would_call"]["tool"])
+
+    def test_step_up_requires_step_up_assurance(self):
+        backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:100)
+        request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="step",minimum_control="step_up")
+        with self.assertRaisesRegex(ApprovalRejected,"assurance"):
+            backend.approve_request(request["request_id"],actor="control",assurance="ask")
+        approved=backend.approve_request(request["request_id"],actor="signed-human",assurance="step_up")
+        self.assertEqual("simulated",approved["state"])
 
     def test_read_and_prohibited_catalog_entries_are_not_requestable(self):
         backend = CoreBackend(build_policy(self.catalog, self.principals), approval_key=bytes.fromhex("22" * 32), clock=lambda: 100)
