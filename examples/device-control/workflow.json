@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "mode": "simulation_only",
+  "execution_enabled": false,
+  "workflows": {
+    "device.power_off": {
+      "description": "Power off an allowlisted device after a safety check, notification, approval and immediate safety recheck.",
+      "principals": ["*"],
+      "target_tool": "device.power_off",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["device_id"],
+        "properties": {
+          "device_id": {"type":"string","enum":["example-display","example-lamp"]}
+        }
+      },
+      "gates": [
+        {"id":"schema","kind":"schema","requires":[]},
+        {"id":"safe","kind":"tool","requires":["schema"],"tool":"device.safe_to_power_off","input":{"device_id":"$parameters.device_id"},"expect":{"path":"safe","op":"eq","value":true},"recheck":false},
+        {"id":"notify","kind":"notify","requires":["safe"],"recipient":"human_owner","template":"Review device power request"},
+        {"id":"approval","kind":"approval","requires":["notify"],"level":"human_approve_once","ttl_seconds":300},
+        {"id":"recheck_safe","kind":"tool","requires":["approval"],"tool":"device.safe_to_power_off","input":{"device_id":"$parameters.device_id"},"expect":{"path":"safe","op":"eq","value":true},"recheck":true},
+        {"id":"execute","kind":"execute","requires":["recheck_safe"],"tool":"device.power_off","simulation_only":true}
+      ]
+    }
+  }
+}

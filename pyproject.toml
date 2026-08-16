@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semantic-gate"
+version = "0.1.0"
+description = "Deterministic semantic permission and gating gateway for agent tools"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{name = "Semantic Gate contributors"}]
+keywords = ["agents", "mcp", "permissions", "policy", "approval", "security"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+]
+dependencies = []
+
+[project.scripts]
+semantic-gate-mcp = "semantic_gate.mcp:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "mode": "simulation_only",
+  "execution_enabled": false,
+  "workflows": {
+    "calendar.create_event": {
+      "description": "Create a calendar event after deterministic checks, notification and exact approval.",
+      "principals": ["*"],
+      "target_tool": "calendar.create_event",
+      "parameter_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "provider", "start", "end"],
+        "properties": {
+          "title": {"type": "string", "minLength": 1},
+          "provider": {"type": "string", "minLength": 1},
+          "start": {"type": "string", "minLength": 1},
+          "end": {"type": "string", "minLength": 1}
+        }
+      },
+      "gates": [
+        {"id":"schema","kind":"schema","requires":[]},
+        {"id":"intent","kind":"condition","requires":["schema"],"path":"trusted_context.direct_user_request","op":"eq","value":true},
+        {"id":"calendar","kind":"tool","requires":["intent"],"tool":"calendar.no_conflict","input":{"start":"$parameters.start","end":"$parameters.end"},"expect":{"path":"ok","op":"eq","value":true},"recheck":false},
+        {"id":"terms","kind":"tool","requires":["calendar"],"tool":"provider.terms_current","input":{"provider":"$parameters.provider"},"expect":{"path":"current","op":"eq","value":true},"recheck":false},
+        {"id":"notify","kind":"notify","requires":["terms"],"recipient":"human_owner","template":"Review calendar action"},
+        {"id":"approval","kind":"approval","requires":["notify"],"level":"human_step_up","ttl_seconds":300},
+        {"id":"recheck_calendar","kind":"tool","requires":["approval"],"tool":"calendar.no_conflict","input":{"start":"$parameters.start","end":"$parameters.end"},"expect":{"path":"ok","op":"eq","value":true},"recheck":true},
+        {"id":"recheck_terms","kind":"tool","requires":["recheck_calendar"],"tool":"provider.terms_current","input":{"provider":"$parameters.provider"},"expect":{"path":"current","op":"eq","value":true},"recheck":true},
+        {"id":"execute","kind":"execute","requires":["recheck_terms"],"tool":"calendar.create_event","simulation_only":true}
+      ]
+    }
+  }
+}
