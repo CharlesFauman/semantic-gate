@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "semantic-gate"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Deterministic semantic permission and gating gateway for agent tools"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -29,3 +29,6 @@ semantic-gate-server = "semantic_gate.httpd:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "semantic_gate.__version__"}

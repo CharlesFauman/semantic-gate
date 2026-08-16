@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+import semantic_gate  # noqa: E402
 from semantic_gate.engine import GatePolicyError, RecordingNotifier, ToolRegistry  # noqa: E402
 from semantic_gate.mcp import MAX_JSON_RPC_LINE_CHARS, build_server, process_message  # noqa: E402
 
@@ -42,6 +43,7 @@ class SemanticGateMCPTests(unittest.TestCase):
         })
         self.assertEqual("2025-03-26", initialized["result"]["protocolVersion"])
         self.assertEqual("semantic-gate", initialized["result"]["serverInfo"]["name"])
+        self.assertEqual(semantic_gate.__version__, initialized["result"]["serverInfo"]["version"])
 
         tools = self.call("tools/list", request_id=2)["result"]["tools"]
         names = {tool["name"] for tool in tools}
@@ -96,6 +98,7 @@ class SemanticGateMCPTests(unittest.TestCase):
     def test_stdio_transport_handles_multiple_messages(self):
         incoming = io.StringIO("\n".join([
             json.dumps({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}),
+            json.dumps({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
             json.dumps({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
         ]) + "\n")
         outgoing = io.StringIO()
@@ -103,6 +106,22 @@ class SemanticGateMCPTests(unittest.TestCase):
         messages = [json.loads(line) for line in outgoing.getvalue().splitlines()]
         self.assertEqual([1,2],[message["id"] for message in messages])
         self.assertIn("tools",messages[1]["result"])
+
+    def test_binary_transport_requires_initialize_lifecycle_before_tools(self):
+        messages = [
+            {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
+            {"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1"}}},
+            {"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}},
+            {"jsonrpc":"2.0","method":"notifications/initialized","params":{}},
+            {"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}},
+        ]
+        incoming=io.BytesIO(b"".join(json.dumps(message).encode()+b"\n" for message in messages))
+        outgoing=io.BytesIO(); self.server.serve_binary(incoming,outgoing)
+        responses=[json.loads(line) for line in outgoing.getvalue().splitlines()]
+        self.assertEqual(-32002,responses[0]["error"]["code"])
+        self.assertIn("serverInfo",responses[1]["result"])
+        self.assertEqual(-32002,responses[2]["error"]["code"])
+        self.assertIn("tools",responses[3]["result"])
 
     def test_json_rpc_ids_and_non_finite_numbers_are_rejected_correctly(self):
         explicit_null = process_message(self.server, {"jsonrpc":"2.0","id":None,"method":"unknown","params":{}})

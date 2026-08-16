@@ -1,5 +1,7 @@
 """Deterministic semantic permission gates for agent tools."""
 
+__version__ = "0.2.0"
+
 from .engine import (
     ApprovalRejected,
     ExecutionAuthority,

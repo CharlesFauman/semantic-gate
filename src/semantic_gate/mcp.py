@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping, TextIO
 
+from . import __version__
 from .engine import (
     DenyAllApprovalVerifier,
     GatePolicyError,
@@ -20,6 +21,9 @@ from .engine import (
 
 SUPPORTED_PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 DEFAULT_PROTOCOL = "2025-03-26"
+MCP_NEW = "new"
+MCP_INITIALIZE_RESPONDED = "initialize_responded"
+MCP_READY = "ready"
 
 
 def _reject_nonfinite_constant(value: str) -> None:
@@ -155,6 +159,7 @@ class SemanticGateMCP:
         self.engine = engine
         self.principal = principal
         self.trusted_context = _strict_json_copy(trusted_context)
+        self._mcp_state = MCP_NEW
 
     def call_tool(self, name: str, arguments: Mapping[str, Any]) -> dict:
         if not isinstance(arguments, Mapping):
@@ -192,6 +197,7 @@ class SemanticGateMCP:
         }
 
     def serve(self, incoming: TextIO, outgoing: TextIO) -> None:
+        self._mcp_state = MCP_NEW
         while True:
             raw_line = incoming.readline(MAX_JSON_RPC_LINE_CHARS + 1)
             if raw_line == "":
@@ -209,7 +215,7 @@ class SemanticGateMCP:
             else:
                 try:
                     message = json.loads(raw_line, parse_constant=_reject_nonfinite_constant)
-                    response = process_message(self, message)
+                    response = process_message(self, message, enforce_lifecycle=True)
                 except (json.JSONDecodeError, TypeError, ValueError, OverflowError, RecursionError) as error:
                     response = _error(None, -32700, f"parse error: {error}")
             if response is not None:
@@ -222,6 +228,7 @@ class SemanticGateMCP:
 
     def serve_binary(self, incoming: BinaryIO, outgoing: BinaryIO) -> None:
         """Serve stdio bytes while containing malformed UTF-8 as parse errors."""
+        self._mcp_state = MCP_NEW
         while True:
             raw_line = incoming.readline(MAX_JSON_RPC_LINE_CHARS + 1)
             if raw_line == b"":
@@ -237,7 +244,7 @@ class SemanticGateMCP:
                     if not decoded.strip():
                         continue
                     message = json.loads(decoded, parse_constant=_reject_nonfinite_constant)
-                    response = process_message(self, message)
+                    response = process_message(self, message, enforce_lifecycle=True)
                 except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, OverflowError, RecursionError) as error:
                     response = _error(None, -32700, f"parse error: {type(error).__name__}")
             if response is not None:
@@ -280,7 +287,7 @@ def build_server(
     return SemanticGateMCP(engine, principal=principal, trusted_context=trusted_context or {})
 
 
-def process_message(server: SemanticGateMCP, message: Mapping[str, Any]) -> dict | None:
+def process_message(server: SemanticGateMCP, message: Mapping[str, Any], *, enforce_lifecycle: bool = False) -> dict | None:
     if not isinstance(message, Mapping):
         return _error(None, -32600, "invalid request")
     try:
@@ -299,11 +306,15 @@ def process_message(server: SemanticGateMCP, message: Mapping[str, Any]) -> dict
         return _error(request_id if has_id else None, -32600, "method must be a string") if has_id else None
     params = message.get("params", {})
     if method == "notifications/initialized" and not has_id:
+        if enforce_lifecycle and server._mcp_state == MCP_INITIALIZE_RESPONDED:
+            server._mcp_state = MCP_READY
         return None
     if not has_id:
         return None
     try:
         if method == "initialize":
+            if enforce_lifecycle and server._mcp_state != MCP_NEW:
+                return _error(request_id, -32600, "initialize already processed")
             if not isinstance(params, Mapping):
                 raise GatePolicyError("initialize params must be an object")
             _require_args(
@@ -325,18 +336,24 @@ def process_message(server: SemanticGateMCP, message: Mapping[str, Any]) -> dict
             result = {
                 "protocolVersion": protocol,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "semantic-gate", "version": "0.1.0"},
+                "serverInfo": {"name": "semantic-gate", "version": __version__},
                 "instructions": "Propose actions through request_action. Human approval and target execution are not agent-callable MCP tools.",
             }
+            if enforce_lifecycle:
+                server._mcp_state = MCP_INITIALIZE_RESPONDED
         elif method == "ping":
             if not isinstance(params, Mapping) or params:
                 raise GatePolicyError("ping params must be an empty object")
             result = {}
         elif method == "tools/list":
+            if enforce_lifecycle and server._mcp_state != MCP_READY:
+                return _error(request_id, -32002, "server not initialized")
             if not isinstance(params, Mapping) or params:
                 raise GatePolicyError("tools/list params must be an empty object")
             result = {"tools": TOOLS}
         elif method == "tools/call":
+            if enforce_lifecycle and server._mcp_state != MCP_READY:
+                return _error(request_id, -32002, "server not initialized")
             if not isinstance(params, Mapping):
                 raise GatePolicyError("tools/call params must be an object")
             _require_args(params, {"name", "arguments"}, {"name", "arguments"})

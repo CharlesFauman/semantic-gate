@@ -1,6 +1,11 @@
 # Integration guide
 
-Semantic Gate is a policy decision and authorization layer for semantic actions. It is not an agent workflow engine. Integrations should separate proposal, policy evaluation, human approval, authorization consumption and target execution.
+Semantic Gate is a policy decision layer for semantic actions, not an agent
+workflow engine. Keep proposal, policy evaluation, trusted human evidence and
+target execution conceptually distinct. The bundled v0.2 engine nevertheless
+advances synchronously from trusted approval ingestion through rechecks to
+simulation or registered-target invocation; it has no durable intermediate
+authorization-consumption state.
 
 ## Choose an integration option
 
@@ -31,9 +36,21 @@ effective step-up request. The bundled password panel intentionally provides
 only ordinary assurance; connect WebAuthn, a separately authenticated signed
 human channel, quorum, or another reviewed stronger transport for step-up.
 
-## Approval is not execution
+## Approval evidence and execution are distinct—but advancement is synchronous
 
-The invariant **approval is not execution** applies to every integration. Human approval creates trusted evidence for the exact request. It does not schedule, retry or execute the action. The requesting workflow may recheck mutable state, consume a bounded authorization later, or abandon it. Production hosts should keep credentials behind adapters and remove raw agent access before calling an action enforced.
+Human approval is exact request-bound evidence; it is not an agent-callable
+execution command. In the current bundled engine, however, trusted approval
+ingestion **synchronously advances** that same request through mandatory
+rechecks. A simulation workflow returns `simulated`; an enforcing workflow can
+then call its host-registered target and return `executed`, `blocked` or
+`failed`. There is no separately consumable `authorized` state in v0.2.
+
+The agent controls whether to propose a request and whether to propose later
+workflow steps. It cannot approve through MCP. The MCP surface does not expose approval ingestion to the agent. A host that needs approval and target
+consumption separated in time must add that orchestration boundary itself; it
+must not describe the bundled engine as providing one. Production hosts should
+keep credentials behind the registered target adapter and remove raw agent
+access before marking an action enforced.
 
 ## Direct Python SDK
 

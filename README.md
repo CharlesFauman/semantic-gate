@@ -16,7 +16,41 @@ Start extending with [`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md),
 which compares SDK, HTTP, MCP, observer, fixed-recipe and node-broker options and
 links runnable examples under `examples/integrations/`.
 
-> **Status:** alpha. All bundled examples are simulation-only. The default MCP
+### Learn by running
+
+- [`docs/BUZZ_INTEGRATION.md`](docs/BUZZ_INTEGRATION.md) — Buzz verified-
+  reaction boundary → host approval → recheck flow, with production signature
+  responsibilities explicit.
+- [`docs/EXISTING_TOOLS_AND_MCP.md`](docs/EXISTING_TOOLS_AND_MCP.md) — put
+  existing MCP read tools and effectful targets on the correct side of the
+  trust boundary.
+- [`docs/MULTI_STEP_FLOWS.md`](docs/MULTI_STEP_FLOWS.md) — agent-owned
+  branching, retries, compensation and unknown outcomes across separate
+  permission requests.
+- [`docs/ASSERTIONS.md`](docs/ASSERTIONS.md) — exact library guarantees,
+  host responsibilities and non-guarantees.
+
+Run the offline examples directly:
+
+```sh
+make example-buzz
+make example-mcp
+make example-mcp-host  # launches the agent-facing MCP host and calls it
+make example-multistep
+# or all runnable flows:
+make examples
+```
+
+No installation is required for the Make targets. For a virtual-environment
+install and existing-MCP before/after configuration, see
+[`examples/integrations/README.md`](examples/integrations/README.md).
+
+All default examples are simulation-only. After reviewing the trust-boundary
+guide, `make example-mcp-enforcing-mock` is an explicit opt-in proof that invokes
+only the bundled local mock target with a host-owned `ExecutionAuthority`; it
+does not contact a real external system.
+
+> **Status:** alpha. All default examples are simulation-only. The default MCP
 > server installs a deny-all approval verifier and no execution authority.
 > The coordinator added in v0.2 also generates simulation-only policy and expires
 > unresolved requests on restart; it does not claim crash-safe live execution.
@@ -25,7 +59,21 @@ links runnable examples under `examples/integrations/`.
 
 Prompt instructions such as “ask before buying” are useful guidance, but not a
 security boundary. Semantic Gate turns that intent into a deterministic state
-machine:
+machine.
+
+### What this helps with
+
+| Problem | Semantic Gate's role |
+|---|---|
+| An agent is told to ask but can skip the prompt rule | Enforce a checked-in gate DAG outside the model |
+| An existing MCP mixes reads and dangerous writes | Keep read-only preconditions visible while moving effectful tools behind a broker |
+| Chat approval could apply to the wrong request | Bind identity, request hash, gate, assurance and expiry |
+| One approval accidentally drives an entire multi-step workflow | Authorize each exact effect separately while the agent retains flow control |
+| Audit hooks exist but raw credentials remain | Label the action shadowed until the direct bypass is removed and tested |
+| Teams need stronger review for selected actions | Let callers escalate to `step_up` but never downgrade policy |
+
+The library fits around existing tools, APIs and MCP servers; it does not require
+replacing them. Its value is the explicit permission boundary and evidence model.
 
 ```text
 normalize request
