@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Transport-independent policy controller around Semantic Gate."""
 from __future__ import annotations
+import re
 
 from typing import Any, Mapping
 
@@ -13,6 +14,8 @@ class GateControlError(ValueError):
 
 class GateControl:
     REQUEST_FIELDS = {"action", "parameters", "context", "idempotency_key"}
+    OBSERVATION_FIELDS = {"event_id","phase","operation","semantic_class","outcome","occurred_at","metadata"}
+    OBSERVATION_METADATA_KEYS = {"surface","node","harness","duration_ms","status","error_type","dropped_events","toolset","version"}
 
     def __init__(self, backend: Any, ledger: Ledger, *, clock):
         self.backend = backend
@@ -68,6 +71,29 @@ class GateControl:
         request.pop("trusted_context", None)
         self.ledger.record_request(request, event="requested", actor=principal)
         return request
+
+    def observe(self, *, principal: str, payload: Mapping[str, Any]):
+        if not isinstance(payload,Mapping):
+            raise GateControlError("observation payload must be an object")
+        unknown=set(payload)-self.OBSERVATION_FIELDS; missing=self.OBSERVATION_FIELDS-set(payload)
+        if unknown: raise GateControlError(f"unknown observation field(s): {sorted(unknown)}")
+        if missing: raise GateControlError(f"missing observation field(s): {sorted(missing)}")
+        event_id=payload["event_id"]
+        if not isinstance(event_id,str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}",event_id): raise GateControlError("event_id is invalid")
+        if not isinstance(payload["phase"],str) or payload["phase"] not in {"attempted","completed"}: raise GateControlError("phase is invalid")
+        if not isinstance(payload["outcome"],str) or payload["outcome"] not in {"started","succeeded","failed","cancelled","unknown"}: raise GateControlError("outcome is invalid")
+        for key in ("operation","semantic_class"):
+            if not isinstance(payload[key],str) or not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,200}",payload[key]): raise GateControlError(f"{key} is invalid")
+        if type(payload["occurred_at"]) is not int or payload["occurred_at"]<0: raise GateControlError("occurred_at is invalid")
+        metadata=payload["metadata"]
+        if not isinstance(metadata,Mapping) or len(metadata)>16: raise GateControlError("metadata must be a bounded object")
+        for key,value in metadata.items():
+            if key not in self.OBSERVATION_METADATA_KEYS: raise GateControlError(f"metadata key is not allowed: {key}")
+            if type(value) not in {str,int,bool,type(None)} or isinstance(value,str) and not re.fullmatch(r"[A-Za-z0-9_.:/-]{0,128}",value) or type(value) is int and not 0<=value<=2**63-1:
+                raise GateControlError("metadata values must be flat scalar labels")
+        observation={key:payload[key] for key in self.OBSERVATION_FIELDS}
+        observation["metadata"]=dict(metadata); observation["principal"]=principal; observation["received_at"]=int(self.clock())
+        return self.ledger.record_observation(observation)
 
     def get_request(self, request_id: str, *, principal: str, admin: bool = False):
         request = self.ledger.get_request(request_id)

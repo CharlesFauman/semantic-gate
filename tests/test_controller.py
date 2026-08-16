@@ -88,6 +88,24 @@ class GateControlTests(unittest.TestCase):
         result=self.control.get_request("old",principal="hermes-mac")
         self.assertEqual("expired",result["state"])
 
+    def test_observation_identity_and_privacy_shape_are_host_enforced(self):
+        payload={"event_id":"call-1:completed","phase":"completed","operation":"terminal","semantic_class":"compute.exec.arbitrary","outcome":"succeeded","occurred_at":99,"metadata":{"surface":"hermes","duration_ms":12}}
+        result=self.control.observe(principal="hermes-mac",payload=payload)
+        self.assertEqual("hermes-mac",result["principal"])
+        self.assertEqual(100,result["received_at"])
+        self.control.clock=lambda:101
+        self.assertEqual(result,self.control.observe(principal="hermes-mac",payload=payload))
+        with self.assertRaisesRegex(GateControlError,"unknown observation field"):
+            self.control.observe(principal="hermes-mac",payload={**payload,"principal":"forged"})
+        with self.assertRaisesRegex(GateControlError,"metadata key"):
+            self.control.observe(principal="hermes-mac",payload={**payload,"event_id":"call-2","metadata":{"raw_args":{"secret":"no"}}})
+        with self.assertRaisesRegex(GateControlError,"flat scalar"):
+            self.control.observe(principal="hermes-mac",payload={**payload,"event_id":"call-2b","metadata":{"surface":{"secret":"no"}}})
+        with self.assertRaisesRegex(GateControlError,"metadata key"):
+            self.control.observe(principal="hermes-mac",payload={**payload,"event_id":"call-3","metadata":{"raw":"rm -rf /"}})
+        with self.assertRaisesRegex(GateControlError,"operation is invalid"):
+            self.control.observe(principal="hermes-mac",payload={**payload,"event_id":"call-4","operation":"rm -rf /"})
+
 
 if __name__ == "__main__":
     unittest.main()

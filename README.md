@@ -125,6 +125,7 @@ See [`examples/`](examples/) for calendar, purchase and device-control flows.
 `semantic-gate-server` runs a dependency-free HTTP coordinator with:
 
 - proposal/status/cancellation REST endpoints;
+- authenticated, idempotent audit-only permission observations;
 - proposal-only MCP over HTTP;
 - a mobile control panel for simulation review;
 - SQLite request snapshots, audit events and emergency controls;
@@ -135,6 +136,14 @@ See [`examples/`](examples/) for calendar, purchase and device-control flows.
 remote execution plugins implement `ActionPlugin` and run behind `NodeBroker`.
 The broker accepts only signed, expiring, single-use leases addressed to an exact
 node, plugin, semantic action and canonical parameter hash.
+
+`POST /api/v1/audit-observations` is an outcome-neutral observation lane for
+host hooks. The bearer capability supplies the principal; callers may submit
+only bounded operation/class/outcome labels and flat scalar metadata. Raw
+prompts, arguments, results, commands, file contents and credentials do not
+belong in this endpoint. The default ledger retains at most 100,000 observations
+and 200,000 audit rows; hosts may choose lower bounds. Observation ingestion is
+not approval or evidence that an old direct-capability bypass has been removed.
 
 The bundled `RecipePlugin` demonstrates safe local control: fixed executable,
 fixed argument vector and allowlisted parameter values, with no shell. It is

@@ -146,6 +146,8 @@ class SemanticGateApplication:
             if route=="/mcp" and method=="POST": return self._mcp(self._bearer(headers),self._decode(body))
             if route=="/api/v1/actions" and method=="GET":
                 p=self._bearer(headers); return _json(200,self.control.list_actions(p.principal_id))
+            if route=="/api/v1/audit-observations" and method=="POST":
+                p=self._bearer(headers); return _json(200,self.control.observe(principal=p.principal_id,payload=self._decode(body)))
             if route=="/api/v1/requests" and method=="POST":
                 p=self._bearer(headers); return _json(201,self.control.request_action(principal=p.principal_id,payload=self._decode(body),host_context={"surface":"http","authenticated_principal":p.principal_id}))
             if route=="/api/v1/requests" and method=="GET":

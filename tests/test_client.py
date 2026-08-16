@@ -19,6 +19,8 @@ class ClientTests(SemanticGateApplicationTests):
             request=client.request_action("device.power_off",parameters={},context={"surface":"sdk"},idempotency_key="sdk-one")
             self.assertEqual("agent",request["requester"])
             self.assertEqual("waiting_for_approval",request["state"])
+            observation=client.observe_permission(event_id="sdk-tool:completed",phase="completed",operation="terminal",semantic_class="compute.exec.arbitrary",outcome="succeeded",occurred_at=99,metadata={"surface":"sdk"})
+            self.assertEqual("agent",observation["principal"])
             self.assertEqual("cancelled",client.cancel_request(request["request_id"])["state"])
         finally:
             server.shutdown(); server.server_close(); thread.join(2)

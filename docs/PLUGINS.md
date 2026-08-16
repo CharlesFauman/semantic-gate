@@ -43,6 +43,15 @@ A macOS plugin can internally invoke a checked-in AppleScript file or native hel
 
 A Windows plugin should use a constrained helper or JEA endpoint and run in the correct non-interactive or interactive session for the action. Never make a service-session broker silently manipulate an active user desktop.
 
+## Audit-only host hooks
+
+Hosts that already possess broad capabilities can migrate incrementally by
+reporting content-free attempted/completed observations before removing the
+old bypass. Use unique event IDs, preserve observations durably across
+outages, derive the principal from its bearer capability, and report queue
+loss explicitly. Observation ingestion is not approval, policy enforcement,
+or evidence that an observed action passed through a non-bypassable broker.
+
 ## Remote plugins
 
 A plugin may call a remote API, Home Assistant, another MCP server or a node-specific service. Credentials remain in that plugin's process or platform credential store. The coordinator and agent receive only redacted metadata and result fingerprints.
