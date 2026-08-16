@@ -38,6 +38,14 @@ class PublicReadinessTests(unittest.TestCase):
                 self.assertEqual("simulation_only", policy["mode"])
                 self.assertFalse(policy["execution_enabled"])
 
+    def test_generic_package_contains_no_private_deployment_identifiers(self):
+        forbidden = ("he" + "lm.action.", "fau" + "man", "home" + ":8662", "100.99" + ".36.95")
+        paths = list((ROOT / "src").rglob("*.py")) + list((ROOT / "tests").rglob("*.py"))
+        for path in paths:
+            text = path.read_text(errors="replace").casefold()
+            for value in forbidden:
+                self.assertNotIn(value.casefold(), text, f"private identifier {value!r} in {path.relative_to(ROOT)}")
+
     def test_no_tracked_secrets_or_environment_files(self):
         completed = subprocess.run(["git","ls-files"],cwd=ROOT,text=True,capture_output=True,check=True)
         suspicious = [line for line in completed.stdout.splitlines() if "secret" in line.casefold() or line.endswith(".env")]

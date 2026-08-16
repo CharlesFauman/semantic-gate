@@ -107,6 +107,32 @@ AND all current preconditions pass
 AND host supplied execution authority
 ```
 
+### Coordinator service and durable projection
+
+The optional coordinator wraps the engine with host-authenticated principals,
+SQLite snapshots/audit metadata, emergency pause/revocation controls, REST,
+HTTP MCP and a human simulation-review panel. Requester identity and trusted
+context are derived by the host transport, not accepted from tool arguments.
+
+The current storage layer is deliberately fail-closed rather than crash-resuming:
+unresolved snapshots are marked expired when the service restarts. It is useful
+for complete simulation and policy review, but live execution requires a future
+transactional engine/store integration with durable gate evidence, execution
+claims and downstream idempotency.
+
+### Distributed nodes and plugins
+
+The coordinator is the policy decision point. A node broker is a policy
+enforcement point on the machine or network that owns a capability. Signed
+leases bind a request to one node, plugin, action, parameter hash, policy hash,
+expiry and nonce. Brokers consume leases before execution and never retry a
+target automatically.
+
+Plugins expose semantic operations. The generic recipe plugin intentionally
+cannot accept shell commands, script text, GUI coordinates or arbitrary
+keystrokes. Local and remote effects therefore use the same workflow while
+retaining OS-level and network-level least privilege.
+
 ## MCP boundary
 
 The dependency-free stdio server implements the MCP JSON-RPC methods needed for

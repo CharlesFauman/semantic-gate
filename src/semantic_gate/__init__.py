@@ -9,6 +9,11 @@ from .engine import (
     ToolRegistry,
     load_policy,
 )
+from .auth import CapabilityAuthority, Principal
+from .broker import HMACLeaseAuthority, NodeBroker, SQLiteReplayStore
+from .client import SemanticGateClient
+from .plugins import ActionPlugin, PluginManifest
+from .recipe_plugin import Recipe, RecipePlugin
 
 __all__ = [
     "ApprovalRejected",
@@ -18,4 +23,14 @@ __all__ = [
     "RecordingNotifier",
     "ToolRegistry",
     "load_policy",
+    "ActionPlugin",
+    "CapabilityAuthority",
+    "HMACLeaseAuthority",
+    "NodeBroker",
+    "PluginManifest",
+    "Principal",
+    "Recipe",
+    "RecipePlugin",
+    "SQLiteReplayStore",
+    "SemanticGateClient",
 ]
