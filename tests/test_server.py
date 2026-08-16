@@ -31,11 +31,12 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.tmp=tempfile.TemporaryDirectory(); root=Path(self.tmp.name)
         self.ledger=Ledger(root/"ledger.sqlite3")
         self.control=GateControl(FakeBackend(),self.ledger,clock=lambda:100)
-        principals={"agent":{"role":"agent","enabled":True},"control":{"role":"admin","enabled":True}}
+        principals={"agent":{"role":"agent","enabled":True},"observer":{"role":"observer","enabled":True},"control":{"role":"admin","enabled":True}}
         self.authority=CapabilityAuthority(bytes.fromhex("33"*32),principals)
         credentials=root/"credentials.json"; credentials.write_text(json.dumps({"credentials":{"device":{"adapter":"example","kind":"token","value":"never-render-me"}}}))
         self.app=SemanticGateApplication(self.control,self.authority,CredentialRegistry(credentials),catalog={"actions":{"device.power_off":{"risk":"R2","summary":"Power off"}}},admin_password="correct horse battery staple",origins=["https://control.example","http://127.0.0.1:18790"],clock=lambda:100)
         self.agent={"Authorization":f"Bearer {self.authority.token_for('agent')}"}
+        self.observer={"Authorization":f"Bearer {self.authority.token_for('observer')}"}
     def tearDown(self): self.ledger.close(); self.tmp.cleanup()
     def call(self,method,path,headers=None,payload=None): return self.app.handle(method,path,headers or {},b"" if payload is None else json.dumps(payload).encode())
 
@@ -48,6 +49,16 @@ class SemanticGateApplicationTests(unittest.TestCase):
         names=[tool["name"] for tool in listed["result"]["tools"]]
         self.assertEqual(["list_actions","explain_action","request_action","get_request","cancel_request"],names)
         self.assertEqual(404,self.call("POST","/api/v1/requests/req_1/approve",self.agent,{}).status)
+
+    def test_observer_can_only_submit_audit_observations(self):
+        payload={"event_id":"device-1:attempted","phase":"attempted","operation":"desktop.application.open","semantic_class":"desktop.control.launch","outcome":"started","occurred_at":99,"metadata":{"surface":"device-actions"}}
+        response=self.call("POST","/api/v1/audit-observations",self.observer,payload)
+        self.assertEqual(200,response.status); self.assertEqual("observer",response.json()["principal"])
+        request={"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"observer-nope"}
+        self.assertEqual(403,self.call("GET","/api/v1/actions",self.observer).status)
+        self.assertEqual(403,self.call("POST","/api/v1/requests",self.observer,request).status)
+        self.assertEqual(403,self.call("GET","/api/v1/requests",self.observer).status)
+        self.assertEqual(403,self.call("POST","/mcp",self.observer,{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).status)
 
     def test_browser_gets_login_page_and_redirect(self):
         redirect=self.call("GET","/")

@@ -91,6 +91,11 @@ class SemanticGateApplication:
     def _bearer(self, headers: Mapping[str,str]) -> Principal:
         return self.authority.authenticate_bearer(_header(headers,"Authorization"))
 
+    def _action_bearer(self, headers: Mapping[str,str]) -> Principal:
+        principal=self._bearer(headers)
+        if principal.role=="observer": raise PermissionError("observer principal is audit-only")
+        return principal
+
     @staticmethod
     def _cookie(headers: Mapping[str,str], name: str) -> str | None:
         jar=cookies.SimpleCookie(); jar.load(_header(headers,"Cookie") or ""); morsel=jar.get(name)
@@ -167,17 +172,17 @@ class SemanticGateApplication:
                 try: _,session=self._admin(headers)
                 except AuthError: return Response(303,{"Location":"/login","Cache-Control":"no-store"},b"")
                 return self._panel(session)
-            if route=="/mcp" and method=="POST": return self._mcp(self._bearer(headers),self._decode(body))
+            if route=="/mcp" and method=="POST": return self._mcp(self._action_bearer(headers),self._decode(body))
             if route=="/api/v1/actions" and method=="GET":
-                p=self._bearer(headers); return _json(200,self.control.list_actions(p.principal_id))
+                p=self._action_bearer(headers); return _json(200,self.control.list_actions(p.principal_id))
             if route=="/api/v1/audit-observations" and method=="POST":
                 p=self._bearer(headers); return _json(200,self.control.observe(principal=p.principal_id,payload=self._decode(body)))
             if route=="/api/v1/requests" and method=="POST":
-                p=self._bearer(headers); return _json(201,self.control.request_action(principal=p.principal_id,payload=self._decode(body),host_context={"surface":"http","authenticated_principal":p.principal_id}))
+                p=self._action_bearer(headers); return _json(201,self.control.request_action(principal=p.principal_id,payload=self._decode(body),host_context={"surface":"http","authenticated_principal":p.principal_id}))
             if route=="/api/v1/requests" and method=="GET":
-                p=self._bearer(headers); return _json(200,self.control.list_requests(principal=p.principal_id))
+                p=self._action_bearer(headers); return _json(200,self.control.list_requests(principal=p.principal_id))
             if route.startswith("/api/v1/requests/"):
-                p=self._bearer(headers); parts=route.strip("/").split("/")
+                p=self._action_bearer(headers); parts=route.strip("/").split("/")
                 if len(parts)==4 and method=="GET":
                     return _json(200,self.control.get_request(parts[3],principal=p.principal_id))
                 if len(parts)==5 and parts[4]=="cancel" and method=="POST":
@@ -198,5 +203,6 @@ class SemanticGateApplication:
                 if value["key"] in {"paused_domains","revoked_principals"} and (not isinstance(value["value"],list) or any(not isinstance(item,str) or not item for item in value["value"])): raise GateControlError("control list is invalid")
                 return _json(200,self.control.set_control(value["key"],value["value"],actor=p.principal_id))
             return _json(404,{"error":"not found"})
+        except PermissionError as error: return _json(403,{"error":str(error)})
         except AuthError as error: return _json(401 if route.startswith(("/api/","/mcp")) else 403,{"error":str(error)})
         except (GateControlError,KeyError,ValueError) as error: return _json(400,{"error":str(error)})

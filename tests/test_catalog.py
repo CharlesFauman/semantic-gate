@@ -20,7 +20,7 @@ class PolicyBuilderTests(unittest.TestCase):
                 "home.read":{"domain":"home","risk":"R0","effect":"read","summary":"Read","approval":"none","privacy_classes":[],"constraints":[]},
             },
         }
-        self.principals = {"hermes-mac":{"role":"agent","enabled":True},"codex":{"role":"agent","enabled":False},"control-panel":{"role":"admin","enabled":True}}
+        self.principals = {"hermes-mac":{"role":"agent","enabled":True},"audit-only":{"role":"observer","enabled":True},"codex":{"role":"agent","enabled":False},"control-panel":{"role":"admin","enabled":True}}
 
     def test_generates_only_mutating_requestable_actions_with_explicit_principals(self):
         policy = build_policy(self.catalog, self.principals)
