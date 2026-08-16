@@ -111,6 +111,8 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertNotIn("Please confirm <exact> parts & warranty.",text)
         self.assertIn("LIST-123",text)
         self.assertIn("requirements.pdf",text)
+        self.assertNotIn("Canonical request parameters",text)
+        self.assertNotIn('&quot;details&quot;',text)
 
     def test_http_json_rejects_non_finite_values(self):
         response=self.app.handle("POST","/api/v1/requests",self.agent,b'{"action":"device.power_off","parameters":{"x":NaN},"context":{},"idempotency_key":"nan"}')

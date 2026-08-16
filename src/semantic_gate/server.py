@@ -57,9 +57,8 @@ def _request_review(request: Mapping[str, Any]) -> str:
     )))
     message=details.get("body")
     message_html=f"<h4>Message body</h4><pre class=message>{html.escape(message)}</pre>" if isinstance(message,str) and message else ""
-    canonical=html.escape(json.dumps(parameters,ensure_ascii=False,indent=2,sort_keys=True))
     open_attr=" open" if request.get("state")=="waiting_for_approval" else ""
-    return f"<details class=request-review{open_attr}><summary>Review exact request</summary><dl>{fields}</dl>{message_html}<details><summary>Canonical request parameters</summary><pre>{canonical}</pre></details></details>"
+    return f"<details class=request-review{open_attr}><summary>Review exact request</summary><dl>{fields}</dl>{message_html}</details>"
 
 
 MCP_TOOLS = [
