@@ -32,6 +32,11 @@ def _json(status: int, value: Any, headers: dict[str, str] | None = None) -> Res
     return Response(status,base,json.dumps(value,sort_keys=True,separators=(",", ":"),allow_nan=False).encode())
 
 
+def _header(headers: Mapping[str, str], name: str) -> str | None:
+    wanted=name.casefold()
+    return next((value for key,value in headers.items() if key.casefold()==wanted),None)
+
+
 MCP_TOOLS = [
     {"name":"list_actions","description":"List semantic actions this principal may propose.","inputSchema":{"type":"object","properties":{},"additionalProperties":False}},
     {"name":"explain_action","description":"Explain one action and its deterministic gates.","inputSchema":{"type":"object","properties":{"action":{"type":"string"}},"required":["action"],"additionalProperties":False}},
@@ -60,11 +65,11 @@ class SemanticGateApplication:
         return value
 
     def _bearer(self, headers: Mapping[str,str]) -> Principal:
-        return self.authority.authenticate_bearer(headers.get("Authorization"))
+        return self.authority.authenticate_bearer(_header(headers,"Authorization"))
 
     @staticmethod
     def _cookie(headers: Mapping[str,str], name: str) -> str | None:
-        jar=cookies.SimpleCookie(); jar.load(headers.get("Cookie", "")); morsel=jar.get(name)
+        jar=cookies.SimpleCookie(); jar.load(_header(headers,"Cookie") or ""); morsel=jar.get(name)
         return morsel.value if morsel else None
 
     def _admin(self, headers: Mapping[str,str]) -> tuple[Principal,str]:
@@ -80,7 +85,7 @@ class SemanticGateApplication:
 
     def _require_mutation(self, headers: Mapping[str,str]) -> Principal:
         principal,session=self._admin(headers)
-        if headers.get("Origin", "").rstrip("/") not in self.origins or not hmac.compare_digest(headers.get("X-CSRF-Token", ""),self._csrf(session)):
+        if (_header(headers,"Origin") or "").rstrip("/") not in self.origins or not hmac.compare_digest(_header(headers,"X-CSRF-Token") or "",self._csrf(session)):
             raise AuthError("origin or CSRF validation failed")
         return principal
 

@@ -74,6 +74,10 @@ class SemanticGateApplicationTests(unittest.TestCase):
         loopback={"Cookie":cookie,"Origin":"http://127.0.0.1:18790","X-CSRF-Token":csrf}
         resumed=self.call("POST","/admin/controls",loopback,{"key":"pause_all","value":False})
         self.assertFalse(resumed.json()["pause_all"])
+        lowercase={"cookie":cookie,"origin":"https://control.example","x-csrf-token":csrf}
+        case_insensitive=self.call("POST","/admin/controls",lowercase,{"key":"pause_all","value":True})
+        self.assertEqual(200,case_insensitive.status)
+        self.assertTrue(case_insensitive.json()["pause_all"])
 
     def test_http_json_rejects_non_finite_values(self):
         response=self.app.handle("POST","/api/v1/requests",self.agent,b'{"action":"device.power_off","parameters":{"x":NaN},"context":{},"idempotency_key":"nan"}')
