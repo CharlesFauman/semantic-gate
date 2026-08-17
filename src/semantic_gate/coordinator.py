@@ -79,7 +79,7 @@ class CoreBackend:
     def cancel_request(self, request_id: str, requester: str):
         return self.engine.cancel_request(request_id, requester=requester)
 
-    def approve_request(self, request_id: str, actor: str, assurance: str = "ask", evidence_id: str | None = None, provenance: dict | None = None):
+    def approve_request(self, request_id: str, actor: str, assurance: str = "ask", evidence_id: str | None = None, provenance: dict | None = None, expires_at: int | None = None):
         if assurance not in {"ask","step_up"}:
             raise ApprovalRejected("approval assurance is invalid")
         if evidence_id is not None and (not isinstance(evidence_id,str) or not evidence_id): raise ApprovalRejected("approval evidence_id is invalid")
@@ -92,7 +92,9 @@ class CoreBackend:
             gate for gate in request["gates"]
             if gate["kind"] == "approval" and gate["status"] == "waiting"
         )
-        ttl = int(approval["evidence"]["ttl_seconds"])
+        now=int(self.clock()); ttl = int(approval["evidence"]["ttl_seconds"])
+        if expires_at is not None and (type(expires_at) is not int or expires_at<=now): raise ApprovalRejected("approval expiry is invalid")
+        bounded_expiry=min(now+ttl,expires_at) if expires_at is not None else now+ttl
         evidence = {
             "evidence_id": evidence_id or "approval_" + secrets.token_hex(16),
             "request_id": request_id,
@@ -101,7 +103,7 @@ class CoreBackend:
             "actor": actor,
             "decision": "approve",
             "assurance": assurance,
-            "expires_at": int(self.clock()) + ttl,
+            "expires_at": bounded_expiry,
             "provenance": provenance,
         }
         evidence["signature"] = self.verifier.sign(evidence)

@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import json
+import ast
+import hashlib
+import re
+import sqlite3
 import subprocess
 import sys
 import unittest
@@ -137,6 +141,68 @@ class PublicReadinessTests(unittest.TestCase):
                 self.assertIn("revocation_checker=",call,relative)
                 self.assertIn("expected_policy_hash=engine.policy_hash",call,relative)
         self.assertTrue((ROOT/"examples/integrations/ed25519_approval_flow.py").is_file())
+
+    def test_standalone_implementation_guide_is_complete_and_prominent(self):
+        relative="SEMANTIC_GATE_IMPLEMENTATION_GUIDE.md"
+        path=ROOT/relative
+        self.assertTrue(path.is_file())
+        guide=path.read_text()
+        self.assertGreater(len(guide),30_000)
+        self.assertIn(relative,(ROOT/"README.md").read_text())
+        required=(
+            "# Semantic Gate: Standalone Implementation Guide",
+            "Status: public beta 0.3.0b1",
+            "Threat model", "Non-goals", "Trust boundaries",
+            "Policy owns the minimum control", "Canonical JSON",
+            "Request fingerprint", "Human approval schema",
+            "Ed25519 roster", "Authorization claims",
+            "Host-only bearer storage", "ID-only consumption",
+            "Request state machine", "Authorization state machine",
+            "BEGIN IMMEDIATE", "request_idempotency",
+            "Unknown outcome", "explicit reconciliation",
+            "Declarative MCP adapter", "revocation_checker",
+            "expected_policy_hash=engine.policy_hash",
+            "HTTP boundary", "MCP boundary", "SDK boundary",
+            "simulation_only", '"execution_enabled": false',
+            "Bypass removal", "Migration", "Rollback",
+            "Acceptance tests", "Beta limitations",
+            "not production-ready", "does not control workflow",
+        )
+        for phrase in required: self.assertIn(phrase,guide,phrase)
+        for fence in ("```json","```sql","```python","```sh","```text"):
+            self.assertIn(fence,guide)
+        self.assertNotIn("See the README",guide)
+        self.assertNotIn("consult the repository",guide.casefold())
+
+    def test_standalone_guide_code_fences_are_copyable(self):
+        guide=(ROOT/"SEMANTIC_GATE_IMPLEMENTATION_GUIDE.md").read_text()
+        blocks=re.findall(r"```(\w+)\n(.*?)```",guide,re.DOTALL)
+        counts={}
+        for language,body in blocks:
+            counts[language]=counts.get(language,0)+1
+            if language=="json": json.loads(body)
+            elif language=="python": ast.parse(body)
+            elif language=="sql":
+                database=sqlite3.connect(":memory:")
+                try: database.executescript(body)
+                finally: database.close()
+        for language in ("json","python","sql","sh","text"):
+            self.assertGreater(counts.get(language,0),0,language)
+
+    def test_standalone_guide_canonicalization_vectors_match_reference(self):
+        guide=(ROOT/"SEMANTIC_GATE_IMPLEMENTATION_GUIDE.md").read_text()
+        value={"label":"café","count":1,"active":True}
+        engine=json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode()
+        signed=json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode()
+        self.assertIn(hashlib.sha256(engine).hexdigest(),guide)
+        self.assertIn(hashlib.sha256(signed).hexdigest(),guide)
+        documents=[]
+        for body in re.findall(r"```json\n(.*?)```",guide,re.DOTALL):
+            document=json.loads(body)
+            if isinstance(document,dict) and document.get("version")==2 and "workflows" in document: documents.append(document)
+        self.assertEqual(1,len(documents))
+        encoded=json.dumps(documents[0],sort_keys=True,separators=(",",":"),ensure_ascii=False,allow_nan=False).encode()
+        self.assertIn(hashlib.sha256(encoded).hexdigest(),guide)
 
 
     def test_all_example_workflows_are_valid_and_simulation_only(self):
