@@ -63,6 +63,20 @@ class CoreBackendTests(unittest.TestCase):
         approved=backend.approve_request(request["request_id"],actor="signed-human",assurance="step_up")
         self.assertEqual("authorized",approved["state"])
 
+    def test_signed_approval_expiry_bounds_authorization_lifetime(self):
+        backend=self.backend(); request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="short-expiry")
+        approved=backend.approve_request(request["request_id"],actor="signed-human",assurance="ask",evidence_id="short-lived",provenance={"transport":"ed25519","key_id":"owner-key","signed_at":99,"signature_sha256":"a"*64},expires_at=125)
+        self.assertEqual(125,approved["authorization"]["expires_at"])
+
+    def test_signed_approval_expiry_is_validated_and_clamped_to_gate_ttl(self):
+        backend=self.backend(); request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="expiry-validation")
+        with self.assertRaisesRegex(ApprovalRejected,"expiry"):
+            backend.approve_request(request["request_id"],actor="signed-human",expires_at=100)
+        approved=backend.approve_request(request["request_id"],actor="signed-human",expires_at=10_000)
+        approval=next(gate for gate in approved["gates"] if gate["kind"]=="approval")
+        self.assertEqual(700,approval["evidence"]["expires_at"])
+        self.assertEqual(400,approved["authorization"]["expires_at"])
+
     def test_approval_provenance_is_closed_and_non_secret(self):
         backend=self.backend(); request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="provenance")
         with self.assertRaisesRegex(ApprovalRejected,"provenance"):

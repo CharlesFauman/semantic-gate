@@ -58,11 +58,11 @@ class Ed25519ApprovalTests(unittest.TestCase):
         class Backend:
             def __init__(self,request): self.request=request; self.calls=[]
             def get_request(self,request_id): return self.request
-            def approve_request(self,request_id,actor,assurance,evidence_id=None,provenance=None): self.calls.append((request_id,actor,assurance,evidence_id,provenance)); return {"state":"authorized"}
+            def approve_request(self,request_id,actor,assurance,evidence_id=None,provenance=None,expires_at=None): self.calls.append((request_id,actor,assurance,evidence_id,provenance,expires_at)); return {"state":"authorized"}
         backend=Backend(self.request); bridge=SignedApprovalBridge(self.roster,backend)
         decision=self.decision(); self.assertEqual("authorized",bridge.approve(decision)["state"])
         provenance={"transport":"ed25519","key_id":"owner-key","signed_at":105,"signature_sha256":hashlib.sha256(base64.b64decode(decision["signature"])).hexdigest()}
-        self.assertEqual([("req_one","human:owner","step_up","human-event-1",provenance)],backend.calls)
+        self.assertEqual([("req_one","human:owner","step_up","human-event-1",provenance,150)],backend.calls)
         with self.assertRaises(ApprovalTransportError): bridge.approve(self.decision(actor="service:notifier"))
         self.assertEqual(1,len(backend.calls))
 

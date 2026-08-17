@@ -12,7 +12,11 @@ API, local function, command broker, another MCP server, or any other host-owned
 capability. The optional coordinator service, direct HTTP client, mobile control
 panel and distributed node-broker/plugin SDK use the same semantic action model.
 
-Start with [`docs/QUICKSTART.md`](docs/QUICKSTART.md), then use
+Start here if you want to reproduce the complete system from one document:
+
+- [`SEMANTIC_GATE_IMPLEMENTATION_GUIDE.md`](SEMANTIC_GATE_IMPLEMENTATION_GUIDE.md) — standalone architecture, schemas, state machines, SQL transactions, cryptographic boundaries, APIs, deployment, bypass removal, migration, rollback and acceptance tests.
+
+For a shorter tour, start with [`docs/QUICKSTART.md`](docs/QUICKSTART.md), then use
 [`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md) for SDK, HTTP, MCP,
 observer, fixed-recipe and node-broker options.
 

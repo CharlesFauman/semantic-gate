@@ -109,7 +109,7 @@ class SignedApprovalBridge:
         verified=self.roster.verify(evidence,request)
         signature=base64.b64decode(evidence["signature"],validate=True)
         provenance={"transport":"ed25519","key_id":evidence["key_id"],"signed_at":evidence["signed_at"],"signature_sha256":hashlib.sha256(signature).hexdigest()}
-        return self.backend.approve_request(request_id,actor=verified["actor"],assurance=verified["assurance"],evidence_id=verified["evidence_id"],provenance=provenance)
+        return self.backend.approve_request(request_id,actor=verified["actor"],assurance=verified["assurance"],evidence_id=verified["evidence_id"],provenance=provenance,expires_at=evidence["expires_at"])
 
 
 def main(argv: list[str]|None=None) -> int:
