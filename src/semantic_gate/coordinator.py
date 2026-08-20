@@ -37,6 +37,8 @@ class HostApprovalVerifier:
 
 
 class CoreBackend:
+    APPROVAL_ABSOLUTE_CAP_SECONDS = 6 * 60 * 60
+
     def __init__(self, policy: dict, *, approval_key: bytes, clock, notifier=None):
         self.clock = clock
         self.verifier = HostApprovalVerifier(approval_key)
@@ -67,18 +69,44 @@ class CoreBackend:
     def request_action(self, **kwargs):
         request=self.engine.request_action(**kwargs)
         if request.get("state")=="waiting_for_approval":
-            approval=next(gate for gate in request["gates"] if gate["kind"]=="approval" and gate["status"]=="waiting")
-            challenge=self._decision_challenges.get(request["request_id"])
-            if challenge is None:
-                challenge={
-                    "request_id":request["request_id"],
-                    "request_hash":request["request_hash"],
-                    "approval_gate_id":approval["id"],
-                    "expires_at":int(self.clock())+int(approval["evidence"]["ttl_seconds"]),
-                }
-                self._decision_challenges[request["request_id"]]=challenge
-            request["approval_challenge"]=dict(challenge)
+            notification=next((gate for gate in request["gates"] if gate["kind"]=="notify"),None)
+            evidence=(notification or {}).get("evidence") or {}
+            delivered_at=evidence.get("delivered_at") if evidence.get("delivered") is True else None
+            if type(delivered_at) is int:
+                challenge=self.mark_notification_delivered(request["request_id"],delivered_at=delivered_at)
+                if challenge is not None:
+                    request["approval_challenge"]=challenge
         return request
+
+    def mark_notification_delivered(self, request_id: str, *, delivered_at: int) -> dict | None:
+        request=self.engine.get_request(request_id)
+        if request.get("state")!="waiting_for_approval":
+            return None
+        now=int(self.clock())
+        if type(delivered_at) is not int or delivered_at<request["created_at"] or delivered_at>now:
+            raise ApprovalRejected("notification delivery time is invalid")
+        approval=next(gate for gate in request["gates"] if gate["kind"]=="approval" and gate["status"]=="waiting")
+        deadline=min(
+            delivered_at+int(approval["evidence"]["ttl_seconds"]),
+            request["created_at"]+self.APPROVAL_ABSOLUTE_CAP_SECONDS,
+        )
+        if deadline<=now:
+            return None
+        challenge={
+            "request_id":request["request_id"],
+            "request_hash":request["request_hash"],
+            "approval_gate_id":approval["id"],
+            "expires_at":deadline,
+        }
+        existing=self._decision_challenges.get(request_id)
+        if existing is not None and existing!=challenge:
+            raise ApprovalRejected("decision challenge is already bound to a different delivery")
+        self._decision_challenges[request_id]=challenge
+        return dict(challenge)
+
+    def approval_challenge(self, request_id: str) -> dict | None:
+        challenge=self._decision_challenges.get(request_id)
+        return None if challenge is None else dict(challenge)
 
     def get_request(self, request_id: str, requester: str | None = None):
         if requester is None:

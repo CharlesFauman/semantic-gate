@@ -64,6 +64,14 @@ through the gateway directly.
   ID/hash, approval-gate ID and fixed deadline. Missing, stale, mismatched,
   expired, terminal and replayed decisions fail with HTTP 409; terminal history
   is never rewritten. The password panel cannot claim step-up assurance.
+- **No-JavaScript decision transport:** login and approve-once/deny are ordinary
+  server-rendered POST forms. Decision forms carry the exact immutable challenge
+  plus a session-bound CSRF token; the server still requires an exact allowed
+  Origin. JSON clients remain a separate transport.
+- **Delivery-anchored review window:** an approval challenge is unavailable until
+  trusted notification delivery is confirmed. Its deadline is the earlier of
+  the policy TTL after delivery and six hours after request creation, enforced
+  by the backend for panel and host transports alike.
 - **TOCTOU protection:** enforcing workflows require a post-approval recheck
   after every approval before execution.
 - **Idempotency:** keys are bound to exact canonical requests.
@@ -75,6 +83,9 @@ through the gateway directly.
   pending/delivered/unknown states, attempt/backoff data and token-safe
   claim/complete/release operations that survive restart. A host notifier must
   still perform delivery and provide truthful delivery evidence.
+- **Provider health projection:** deployments may supply bounded outbox/relay
+  status for `/health` and the authenticated panel. Delivery ambiguity remains
+  explicit rather than being retried as though a send definitely failed.
 - **Separated tool roles:** read gates and effectful targets live in different registries.
 - **Dual execution control:** live execution needs policy enablement **and** a host-owned `ExecutionAuthority` object.
 - **Safe MCP defaults:** the CLI MCP server has no trusted approval verifier or execution authority.

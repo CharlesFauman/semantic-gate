@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from urllib.parse import urlencode
 from pathlib import Path
 
 from semantic_gate.auth import CapabilityAuthority
@@ -22,7 +23,9 @@ class FakeBackend:
     def explain_action(self, action, principal): return {"action":action,"execution_enabled":False}
     def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key, minimum_control="policy"):
         request={"request_id":"req_1","request_hash":"h"*64,"action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"policy_control":"ask","effective_control":"step_up" if minimum_control=="step_up" else "ask","gates":[{"id":"approval","kind":"approval","status":"waiting","evidence":{"ttl_seconds":300}}]}
+        request["approval_challenge"]={"request_id":request["request_id"],"request_hash":request["request_hash"],"approval_gate_id":"approval","expires_at":400}
         self.requests[request["request_id"]]=request; return dict(request)
+    def approval_challenge(self, request_id): return dict(self.requests[request_id]["approval_challenge"])
     def get_request(self, request_id, requester=None): return dict(self.requests[request_id])
     def cancel_request(self, request_id, requester): self.requests[request_id]["state"]="cancelled"; return dict(self.requests[request_id])
     def approve_request(self, request_id, actor, challenge): self.requests[request_id]["state"]="simulated"; return dict(self.requests[request_id])
@@ -42,6 +45,8 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.observer={"Authorization":f"Bearer {self.authority.token_for('observer')}"}
     def tearDown(self): self.ledger.close(); self.tmp.cleanup()
     def call(self,method,path,headers=None,payload=None): return self.app.handle(method,path,headers or {},b"" if payload is None else json.dumps(payload).encode())
+    def form(self,method,path,headers=None,fields=None):
+        return self.app.handle(method,path,{"Content-Type":"application/x-www-form-urlencoded",**(headers or {})},urlencode(fields or {}).encode())
 
     def test_agent_http_and_mcp_can_propose_but_never_approve(self):
         self.assertEqual(401,self.call("GET","/api/v1/actions").status)
@@ -78,6 +83,43 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertIn('autocomplete=current-password',text)
         self.assertIn('method=post',text)
         self.assertIn('action=/login',text)
+        self.assertNotIn('<script>',text)
+
+    def test_no_javascript_login_and_exact_decision_forms(self):
+        login=self.form("POST","/login",fields={"username":"control","password":"correct horse battery staple"})
+        self.assertEqual(303,login.status)
+        self.assertEqual("/",login.headers["Location"])
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        request=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"no-js"}).json()
+        panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertIn("<meta http-equiv=refresh content=20>",panel)
+        self.assertIn(f"action='/admin/requests/{request['request_id']}/approve'",panel)
+        self.assertIn(f"action='/admin/requests/{request['request_id']}/deny'",panel)
+        self.assertNotIn("data-op='approve'",panel)
+        self.assertNotIn("data-op='deny'",panel)
+        csrf=re.search(r"name='csrf_token' value='([^']+)'",panel).group(1)
+        fields={"csrf_token":csrf,**{key:str(value) for key,value in request["approval_challenge"].items()}}
+        rejected=self.form("POST",f"/admin/requests/{request['request_id']}/approve",{"Cookie":cookie},fields)
+        self.assertEqual(403,rejected.status)
+        tampered={**fields,"request_hash":"bad"}
+        conflict=self.form("POST",f"/admin/requests/{request['request_id']}/approve",{"Cookie":cookie,"Origin":"https://control.example"},tampered)
+        self.assertEqual(409,conflict.status)
+        approved=self.form("POST",f"/admin/requests/{request['request_id']}/approve",{"Cookie":cookie,"Origin":"https://control.example"},fields)
+        self.assertEqual(303,approved.status)
+        self.assertEqual("/",approved.headers["Location"])
+        self.assertEqual("simulated",self.control.backend.requests[request["request_id"]]["state"])
+
+    def test_login_and_decision_form_fields_remain_separate(self):
+        bad_login=self.form("POST","/login",fields={"username":"control","password":"correct horse battery staple","request_id":"req_1"})
+        self.assertEqual(403,bad_login.status)
+        login=self.form("POST","/login",fields={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        request=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"separate"}).json()
+        panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        csrf=re.search(r"name='csrf_token' value='([^']+)'",panel).group(1)
+        fields={"csrf_token":csrf,"username":"control","password":"correct horse battery staple",**{key:str(value) for key,value in request["approval_challenge"].items()}}
+        response=self.form("POST",f"/admin/requests/{request['request_id']}/approve",{"Cookie":cookie,"Origin":"https://control.example"},fields)
+        self.assertEqual(400,response.status)
 
     def test_control_panel_login_csrf_approval_and_secret_redaction(self):
         self.assertEqual(403,self.call("POST","/login",payload={"username":"control","password":"wrong"}).status)
@@ -132,6 +174,18 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertIn("Notification queued",panel)
         self.assertIn("will retry after provider recovery",panel)
         self.assertIn("notice_",panel)
+
+    def test_health_and_panel_surface_provider_outage_status(self):
+        self.app.status_provider=lambda:{"notification_outbox":{"pending":2,"unknown":1,"oldest_pending_at":90},"relay":{"status":"outage","last_success_at":80,"last_error":"provider unavailable"}}
+        health=self.call("GET","/health").json()
+        self.assertEqual("outage",health["relay"]["status"])
+        self.assertEqual(2,health["notification_outbox"]["pending"])
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertIn("Provider status: outage",panel)
+        self.assertIn("2 pending",panel)
+        self.assertIn("1 unknown",panel)
 
     def test_panel_shows_policy_floor_effective_control_and_step_up_boundary(self):
         login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})

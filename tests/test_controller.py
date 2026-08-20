@@ -23,8 +23,12 @@ class FakeBackend:
     def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key, minimum_control="policy"):
         self.calls.append((action, requester, trusted_context, minimum_control))
         request = {"request_id":f"req_{len(self.calls)}","request_hash":"h"*64,"action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"gates":[{"id":"approve","kind":"approval","status":"waiting","evidence":{"ttl_seconds":300}}]}
+        request["approval_challenge"]={"request_id":request["request_id"],"request_hash":request["request_hash"],"approval_gate_id":"approve","expires_at":400}
         self.requests[request["request_id"]] = request
         return dict(request)
+
+    def approval_challenge(self, request_id):
+        return dict(self.requests[request_id]["approval_challenge"])
 
     def get_request(self, request_id, requester=None):
         return dict(self.requests[request_id])

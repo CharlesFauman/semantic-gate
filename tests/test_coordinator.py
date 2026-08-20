@@ -18,8 +18,15 @@ class CoreBackendTests(unittest.TestCase):
         }}
         self.principals = {"agent":{"role":"agent","enabled":True},"control":{"role":"admin","enabled":True}}
 
+    @staticmethod
+    def delivered(at=100):
+        class Delivered:
+            def notify(self,request,gate):
+                return {"delivered":True,"notification_id":"notice","request_id":request["request_id"],"request_hash":request["request_hash"],"notification_gate_id":gate["id"],"recipient":gate["recipient"],"template_hash":hashlib.sha256(gate["template"].encode()).hexdigest(),"delivered_at":at}
+        return Delivered()
+
     def test_real_core_waits_for_host_approval_then_only_simulates(self):
-        backend = CoreBackend(build_policy(self.catalog, self.principals), approval_key=bytes.fromhex("22" * 32), clock=lambda: 100)
+        backend = CoreBackend(build_policy(self.catalog, self.principals), approval_key=bytes.fromhex("22" * 32), clock=lambda: 100,notifier=self.delivered())
         request = backend.request_action(
             action="home.tv.power_off",
             parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},
@@ -46,8 +53,29 @@ class CoreBackendTests(unittest.TestCase):
         approval=next(g for g in request["gates"] if g["kind"]=="approval" and g["status"]=="waiting")
         self.assertEqual(150+approval["evidence"]["ttl_seconds"],request["approval_challenge"]["expires_at"])
 
+    def test_approval_deadline_is_delivery_anchored_and_absolutely_capped(self):
+        now=[100]
+        class DeliveredNearCap:
+            def notify(self,request,gate):
+                now[0]=100+CoreBackend.APPROVAL_ABSOLUTE_CAP_SECONDS-10
+                return {"delivered":True,"notification_id":"notice","request_id":request["request_id"],"request_hash":request["request_hash"],"notification_gate_id":gate["id"],"recipient":gate["recipient"],"template_hash":hashlib.sha256(gate["template"].encode()).hexdigest(),"delivered_at":now[0]}
+        backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:now[0],notifier=DeliveredNearCap())
+        request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="absolute-cap")
+        self.assertEqual(request["created_at"]+CoreBackend.APPROVAL_ABSOLUTE_CAP_SECONDS,request["approval_challenge"]["expires_at"])
+        now[0]=request["approval_challenge"]["expires_at"]
+        with self.assertRaisesRegex(ApprovalRejected,"expired"):
+            backend.approve_request(request["request_id"],actor="control",challenge=request["approval_challenge"])
+
+    def test_undelivered_notification_has_no_actionable_challenge(self):
+        class Pending:
+            def notify(self,request,gate):
+                return {"delivered":False,"notification_id":"notice","request_id":request["request_id"],"request_hash":request["request_hash"],"notification_gate_id":gate["id"],"recipient":gate["recipient"],"template_hash":hashlib.sha256(gate["template"].encode()).hexdigest(),"delivered_at":None}
+        backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:100,notifier=Pending())
+        request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="pending")
+        self.assertNotIn("approval_challenge",request)
+
     def test_password_backend_cannot_claim_step_up_assurance(self):
-        backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:100)
+        backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:100,notifier=self.delivered())
         request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="step",minimum_control="step_up")
         approval=next(g for g in request["gates"] if g["kind"]=="approval" and g["status"]=="waiting")
         challenge={"request_id":request["request_id"],"request_hash":request["request_hash"],"approval_gate_id":approval["id"],"expires_at":request["created_at"]+approval["evidence"]["ttl_seconds"]}
@@ -56,7 +84,7 @@ class CoreBackendTests(unittest.TestCase):
 
     def test_backend_rejects_mismatched_expired_and_replayed_decisions(self):
         now=[100]
-        backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:now[0])
+        backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:now[0],notifier=self.delivered())
         request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="deny")
         approval=next(g for g in request["gates"] if g["kind"]=="approval" and g["status"]=="waiting")
         exact={"request_id":request["request_id"],"request_hash":request["request_hash"],"approval_gate_id":approval["id"],"expires_at":request["created_at"]+approval["evidence"]["ttl_seconds"]}

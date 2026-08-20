@@ -115,6 +115,18 @@ class Ledger:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def notification_health(self) -> dict:
+        with self._lock:
+            rows=self._db.execute("SELECT state,COUNT(*) AS count,MIN(created_at) AS oldest FROM notification_outbox GROUP BY state").fetchall()
+        result={"pending":0,"delivered":0,"unknown":0,"oldest_pending_at":None}
+        for row in rows:
+            state=str(row["state"])
+            if state in result:
+                result[state]=int(row["count"])
+            if state=="pending":
+                result["oldest_pending_at"]=row["oldest"]
+        return result
+
     def enqueue_notification(self, *, request_id: str, request_hash: str, notify_gate_id: str, recipient: str, template_hash: str, now: int) -> dict:
         binding=(request_id,request_hash,notify_gate_id,recipient,template_hash)
         if any(not isinstance(value,str) or not value for value in binding):

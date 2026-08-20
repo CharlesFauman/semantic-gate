@@ -30,19 +30,9 @@ class GateControl:
     def _attach_approval_challenge(self,request: dict) -> dict:
         if request.get("state") != "waiting_for_approval" or "approval_challenge" in request:
             return request
-        approval = next((gate for gate in request.get("gates", []) if gate.get("kind") == "approval" and gate.get("status") == "waiting"), None)
-        if approval is None:
-            return request
-        evidence = approval.get("evidence") or {}
-        ttl = evidence.get("ttl_seconds")
-        if type(ttl) is not int or ttl < 1:
-            return request
-        request["approval_challenge"] = {
-            "request_id": request["request_id"],
-            "request_hash": request["request_hash"],
-            "approval_gate_id": approval["id"],
-            "expires_at": int(self.clock()) + ttl,
-        }
+        challenge=getattr(self.backend,"approval_challenge",lambda _request_id:None)(request["request_id"])
+        if challenge is not None:
+            request["approval_challenge"]=challenge
         return request
 
     def _allowed(self, principal: str, action: str):
