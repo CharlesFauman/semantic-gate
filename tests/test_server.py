@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,8 +80,10 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertIn('action=/login',text)
 
     def test_control_panel_login_csrf_approval_and_secret_redaction(self):
-        self.assertEqual(403,self.call("POST","/login",payload={"password":"wrong"}).status)
-        login=self.call("POST","/login",payload={"password":"correct horse battery staple"})
+        self.assertEqual(403,self.call("POST","/login",payload={"username":"control","password":"wrong"}).status)
+        self.assertEqual(403,self.call("POST","/login",payload={"password":"correct horse battery staple"}).status)
+        self.assertEqual(403,self.call("POST","/login",payload={"username":"agent","password":"correct horse battery staple"}).status)
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
         self.assertIn("Secure",login.headers["Set-Cookie"])
         cookie=login.headers["Set-Cookie"].split(";",1)[0]; csrf=login.headers["X-CSRF-Token"]
         page=self.call("GET","/",{"Cookie":cookie}); text=page.body.decode()
@@ -109,8 +113,28 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertEqual(200,case_insensitive.status)
         self.assertTrue(case_insensitive.json()["pause_all"])
 
+    @unittest.skipUnless(shutil.which("node"),"node is needed for the panel JavaScript syntax check")
+    def test_rendered_panel_javascript_is_syntax_valid(self):
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"syntax"})
+        panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        script=re.findall(r"<script>(.*?)</script>",panel,flags=re.DOTALL)[0]
+        completed=subprocess.run(["node","--check","-"],input=script,text=True,capture_output=True,check=False)
+        self.assertEqual(0,completed.returncode,completed.stderr)
+
+    def test_panel_shows_durable_notification_delivery_and_recovery_status(self):
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        request=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"notice-status"}).json()
+        self.ledger.enqueue_notification(request_id=request["request_id"],request_hash=request["request_hash"],notify_gate_id="notify",recipient="owner",template_hash="a"*64,now=100)
+        panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertIn("Notification queued",panel)
+        self.assertIn("will retry after provider recovery",panel)
+        self.assertIn("notice_",panel)
+
     def test_panel_shows_policy_floor_effective_control_and_step_up_boundary(self):
-        login=self.call("POST","/login",payload={"password":"correct horse battery staple"})
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
         cookie=login.headers["Set-Cookie"].split(";",1)[0]
         self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"step-up-panel","minimum_control":"step_up"})
         text=self.call("GET","/",{"Cookie":cookie}).body.decode()
@@ -118,7 +142,7 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertIn("step_up",text); self.assertIn("Step-up required",text)
 
     def test_control_panel_renders_exact_communication_for_meaningful_approval(self):
-        login=self.call("POST","/login",payload={"password":"correct horse battery staple"})
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
         cookie=login.headers["Set-Cookie"].split(";",1)[0]
         parameters={
             "summary":"Email supplier before purchase",

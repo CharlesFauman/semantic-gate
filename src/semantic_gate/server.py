@@ -140,22 +140,39 @@ class SemanticGateApplication:
             challenge=item.get("approval_challenge")
             if not isinstance(challenge,Mapping):
                 return "<span>Decision unavailable; refresh or submit a new proposal.</span>"
+            if type(challenge.get("expires_at")) is int and challenge["expires_at"]<=int(self.clock()):
+                return "<b>Approval expired.</b> Submit a new proposal; this request cannot be revived."
             encoded=html.escape(json.dumps(dict(challenge),sort_keys=True,separators=(",", ":")),quote=True)
             deny=f"<button data-id='{request_id}' data-op='deny' data-challenge='{encoded}'>Deny</button>"
             if item.get("effective_control")=="step_up":
                 return "<button disabled>Step-up required</button> "+deny
             return f"<button data-id='{request_id}' data-op='approve' data-challenge='{encoded}'>Approve once</button> "+deny
+        def notification_status(item: Mapping[str,Any]) -> str:
+            notices=self.control.ledger.notifications_for_request(str(item["request_id"]))
+            if not notices:
+                return "<span>No durable notification record.</span>"
+            rendered=[]
+            for notice in notices:
+                state=notice["state"]
+                if state=="pending": message="Notification queued; will retry after provider recovery."
+                elif state=="delivered": message="Notification delivered."
+                else: message="Notification outcome unknown; automatic retry stopped to prevent duplicates."
+                rendered.append(
+                    f"<div><b>{html.escape(message)}</b><br><code>{html.escape(notice['notification_id'])}</code>"
+                    f" · attempts {int(notice['attempts'])}</div>"
+                )
+            return "".join(rendered)
         rows="".join(
             f"<tr><td>{html.escape(r['request_id'])}</td><td>{html.escape(r['action'])}</td><td>{html.escape(r['requester'])}</td>"
             f"<td>{html.escape(str(r.get('policy_control','policy')))}</td><td>{html.escape(str(r.get('minimum_control','policy')))}</td>"
             f"<td>{html.escape(str(r.get('effective_control','policy')))}</td><td><b>{html.escape(r['state'])}</b></td>"
-            f"<td>{_request_review(r)}</td><td>{decision_buttons(r)}</td></tr>" for r in requests
+            f"<td>{notification_status(r)}</td><td>{_request_review(r)}</td><td>{decision_buttons(r)}</td></tr>" for r in requests
         )
         action_rows="".join(f"<tr><td><code>{html.escape(a)}</code></td><td>{html.escape(str(v.get('risk','')))}</td><td>{html.escape(str(v.get('effect','')))}</td><td>{html.escape(str(v.get('summary','')))}</td></tr>" for a,v in sorted(actions.items()))
         cred_rows="".join(f"<tr><td>{html.escape(c['credential_id'])}</td><td>{html.escape(c['adapter'])}</td><td>{html.escape(c['status'])}</td></tr>" for c in self.credentials.public_inventory())
         audit_rows="".join(f"<tr><td>{a['seq']}</td><td>{html.escape(str(a['event']))}</td><td>{html.escape(str(a['actor']))}</td><td>{html.escape(str(a.get('request_id') or ''))}</td><td>{a['at']}</td></tr>" for a in audits)
         csrf=self._csrf(session)
-        page=f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><meta name=csrf content='{csrf}'><title>Semantic Gate</title><style>body{{font:15px system-ui;background:#0b1020;color:#edf2ff;margin:0}}main{{max-width:1500px;margin:auto;padding:20px}}section{{background:#151c31;border:1px solid #2b3658;border-radius:14px;padding:16px;margin:14px 0;overflow:auto}}table{{border-collapse:collapse;width:100%}}td,th{{padding:9px;border-bottom:1px solid #2b3658;text-align:left;vertical-align:top}}button{{background:#6ea8fe;color:#07101f;border:0;border-radius:8px;padding:8px;margin:3px}}button.danger{{background:#ff7b72}}code{{color:#9bdcff}}.safe{{color:#85e89d}}.request-review{{min-width:min(620px,75vw)}}.request-review>summary{{font-weight:700;color:#9bdcff;cursor:pointer;padding:8px 0}}dl{{display:grid;grid-template-columns:max-content minmax(220px,1fr);gap:6px 12px}}dt{{color:#aab6d3;font-weight:700}}dd{{margin:0;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1020;border:1px solid #2b3658;border-radius:8px;padding:10px}}pre.message{{font:14px/1.45 system-ui}}</style><main><h1>Semantic Gate</h1><p class=safe>Execution is globally disabled; decisions simulate only.</p><section><h2>Emergency controls</h2><button class=danger data-control=pause_all data-value=true>Pause all</button><button data-control=pause_all data-value=false>Resume proposals</button><button data-list=paused_domains>Set paused domains</button><button data-list=revoked_principals>Set revoked principals</button><pre>{html.escape(json.dumps(controls,indent=2))}</pre></section><section><h2>Requests</h2><table><tr><th>ID</th><th>Action</th><th>Principal</th><th>Policy control</th><th>Caller floor</th><th>Effective control</th><th>State</th><th>Exact request</th><th>Decision</th></tr>{rows}</table></section><section><h2>Credential bindings</h2><table>{cred_rows}</table></section><section><h2>Action catalogue</h2><table><tr><th>Action</th><th>Risk</th><th>Effect</th><th>Summary</th></tr>{action_rows}</table></section><section><h2>Audit</h2><table><tr><th>#</th><th>Event</th><th>Actor</th><th>Request</th><th>Time</th></tr>{audit_rows}</table></section></main><script>document.addEventListener('click',async e=>{{let path,body={{}};if(e.target.dataset.op){{path='/admin/requests/'+e.target.dataset.id+'/'+e.target.dataset.op;body=JSON.parse(e.target.dataset.challenge)}}else if(e.target.dataset.control){{path='/admin/controls';body={{key:e.target.dataset.control,value:e.target.dataset.value==='true'}}}}else if(e.target.dataset.list){{path='/admin/controls';let raw=prompt('Comma-separated values (empty clears):','');if(raw===null)return;body={{key:e.target.dataset.list,value:raw.split(',').map(x=>x.trim()).filter(Boolean)}}}}else return;let r=await fetch(path,{{method:'POST',headers:{{'Origin':location.origin,'X-CSRF-Token':document.querySelector('meta[name=csrf]').content,'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(r.ok)location.reload();else alert(await r.text())}})</script>"""
+        page=f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><meta name=csrf content='{csrf}'><title>Semantic Gate</title><style>body{{font:15px system-ui;background:#0b1020;color:#edf2ff;margin:0}}main{{max-width:1500px;margin:auto;padding:20px}}section{{background:#151c31;border:1px solid #2b3658;border-radius:14px;padding:16px;margin:14px 0;overflow:auto}}table{{border-collapse:collapse;width:100%}}td,th{{padding:9px;border-bottom:1px solid #2b3658;text-align:left;vertical-align:top}}button{{background:#6ea8fe;color:#07101f;border:0;border-radius:8px;padding:8px;margin:3px}}button.danger{{background:#ff7b72}}code{{color:#9bdcff}}.safe{{color:#85e89d}}.request-review{{min-width:min(620px,75vw)}}.request-review>summary{{font-weight:700;color:#9bdcff;cursor:pointer;padding:8px 0}}dl{{display:grid;grid-template-columns:max-content minmax(220px,1fr);gap:6px 12px}}dt{{color:#aab6d3;font-weight:700}}dd{{margin:0;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1020;border:1px solid #2b3658;border-radius:8px;padding:10px}}pre.message{{font:14px/1.45 system-ui}}</style><main><h1>Semantic Gate</h1><p class=safe>Execution is globally disabled; decisions simulate only.</p><section><h2>Emergency controls</h2><button class=danger data-control=pause_all data-value=true>Pause all</button><button data-control=pause_all data-value=false>Resume proposals</button><button data-list=paused_domains>Set paused domains</button><button data-list=revoked_principals>Set revoked principals</button><pre>{html.escape(json.dumps(controls,indent=2))}</pre></section><section><h2>Requests</h2><table><tr><th>ID</th><th>Action</th><th>Principal</th><th>Policy control</th><th>Caller floor</th><th>Effective control</th><th>State</th><th>Notification</th><th>Exact request</th><th>Decision</th></tr>{rows}</table></section><section><h2>Credential bindings</h2><table>{cred_rows}</table></section><section><h2>Action catalogue</h2><table><tr><th>Action</th><th>Risk</th><th>Effect</th><th>Summary</th></tr>{action_rows}</table></section><section><h2>Audit</h2><table><tr><th>#</th><th>Event</th><th>Actor</th><th>Request</th><th>Time</th></tr>{audit_rows}</table></section></main><script>document.addEventListener('click',async e=>{{let path,body={{}};if(e.target.dataset.op){{path='/admin/requests/'+e.target.dataset.id+'/'+e.target.dataset.op;body=JSON.parse(e.target.dataset.challenge)}}else if(e.target.dataset.control){{path='/admin/controls';body={{key:e.target.dataset.control,value:e.target.dataset.value==='true'}}}}else if(e.target.dataset.list){{path='/admin/controls';let raw=prompt('Comma-separated values (empty clears):','');if(raw===null)return;body={{key:e.target.dataset.list,value:raw.split(',').map(x=>x.trim()).filter(Boolean)}}}}else return;let r=await fetch(path,{{method:'POST',headers:{{'Origin':location.origin,'X-CSRF-Token':document.querySelector('meta[name=csrf]').content,'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(r.ok)location.reload();else alert(await r.text())}})</script>"""
         return Response(200,{"Content-Type":"text/html;charset=UTF-8","Cache-Control":"no-store"},page.encode())
 
     @staticmethod
@@ -191,8 +208,12 @@ class SemanticGateApplication:
             if route=="/health" and method=="GET": return _json(200,{"status":"ok","execution_enabled":False})
             if route=="/login" and method=="GET": return self._login_page()
             if route=="/login" and method=="POST":
-                supplied=self._decode(body).get("password")
-                if not isinstance(supplied,str) or not hmac.compare_digest(supplied,self.admin_password): return _json(403,{"error":"invalid credentials"})
+                credentials=self._decode(body)
+                supplied_user=credentials.get("username","") if set(credentials)=={"username","password"} else ""
+                supplied_password=credentials.get("password","") if set(credentials)=={"username","password"} else ""
+                user_ok=isinstance(supplied_user,str) and hmac.compare_digest(supplied_user,self.admin_principal_id)
+                password_ok=isinstance(supplied_password,str) and hmac.compare_digest(supplied_password,self.admin_password)
+                if not (user_ok and password_ok): return _json(403,{"error":"invalid credentials"})
                 session=self.authority.issue_session(self.admin_principal_id,now=int(self.clock()),ttl_seconds=3600)
                 secure="; Secure" if self.secure_cookies else ""
                 return Response(204,{"Set-Cookie":f"sg_session={session}; HttpOnly; SameSite=Strict; Path=/{secure}","X-CSRF-Token":self._csrf(session),"Cache-Control":"no-store"},b"")

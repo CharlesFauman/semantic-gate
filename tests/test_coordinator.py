@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+import hashlib
 
 from semantic_gate.catalog import build_policy
 from semantic_gate.coordinator import CoreBackend
@@ -33,6 +34,17 @@ class CoreBackendTests(unittest.TestCase):
         self.assertEqual("simulated", approved["state"])
         self.assertFalse(approved["execution_possible"])
         self.assertEqual("semantic.action.home.tv.power_off", approved["would_call"]["tool"])
+
+    def test_approval_deadline_starts_when_the_request_reaches_human_review(self):
+        now=[100]
+        class AdvancingNotifier:
+            def notify(self,request,gate):
+                now[0]=150
+                return {"delivered":True,"notification_id":"notice","request_id":request["request_id"],"request_hash":request["request_hash"],"notification_gate_id":gate["id"],"recipient":gate["recipient"],"template_hash":hashlib.sha256(gate["template"].encode()).hexdigest(),"delivered_at":150}
+        backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:now[0],notifier=AdvancingNotifier())
+        request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="deadline")
+        approval=next(g for g in request["gates"] if g["kind"]=="approval" and g["status"]=="waiting")
+        self.assertEqual(150+approval["evidence"]["ttl_seconds"],request["approval_challenge"]["expires_at"])
 
     def test_password_backend_cannot_claim_step_up_assurance(self):
         backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:100)

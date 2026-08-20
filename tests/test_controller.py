@@ -93,6 +93,8 @@ class GateControlTests(unittest.TestCase):
         self.assertEqual("simulated", result["state"])
         self.assertFalse(result.get("execution_possible", False))
         self.assertEqual(["requested", "approved"], [event["event"] for event in self.ledger.audit_events(request["request_id"])])
+        approved_event=self.ledger.audit_events(request["request_id"])[-1]
+        self.assertEqual({**request["approval_challenge"],"decision":"approve"},approved_event["metadata"])
 
     def test_decisions_require_the_exact_unexpired_challenge_and_are_single_use(self):
         request=self.control.request_action(principal="hermes-mac",payload={"action":"home.tv.power_off","parameters":{},"context":{},"idempotency_key":"challenge"},host_context={})
@@ -102,6 +104,7 @@ class GateControlTests(unittest.TestCase):
                 self.control.deny(request["request_id"],actor="control-panel",actor_role="admin",challenge=challenge)
         denied=self.control.deny(request["request_id"],actor="control-panel",actor_role="admin",challenge=exact)
         self.assertEqual("denied",denied["state"])
+        self.assertEqual({**exact,"decision":"deny"},self.ledger.audit_events(request["request_id"])[-1]["metadata"])
         before=self.ledger.audit_events(request["request_id"])
         with self.assertRaises(GateDecisionConflict):
             self.control.approve(request["request_id"],actor="control-panel",actor_role="admin",challenge=exact)

@@ -27,8 +27,7 @@ class GateControl:
         self.ledger = ledger
         self.clock = clock
 
-    @staticmethod
-    def _attach_approval_challenge(request: dict) -> dict:
+    def _attach_approval_challenge(self,request: dict) -> dict:
         if request.get("state") != "waiting_for_approval" or "approval_challenge" in request:
             return request
         approval = next((gate for gate in request.get("gates", []) if gate.get("kind") == "approval" and gate.get("status") == "waiting"), None)
@@ -42,7 +41,7 @@ class GateControl:
             "request_id": request["request_id"],
             "request_hash": request["request_hash"],
             "approval_gate_id": approval["id"],
-            "expires_at": int(request["created_at"]) + ttl,
+            "expires_at": int(self.clock()) + ttl,
         }
         return request
 
@@ -173,7 +172,7 @@ class GateControl:
             raise GateDecisionConflict(str(error)) from error
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
-        self.ledger.record_request(request, event="approved", actor=actor)
+        self.ledger.record_request(request,event="approved",actor=actor,metadata={**dict(challenge),"decision":"approve"})
         return request
 
     def deny(self, request_id: str, *, actor: str, actor_role: str, challenge: Mapping[str, Any]):
@@ -185,7 +184,7 @@ class GateControl:
         except Exception as error:
             raise GateDecisionConflict(str(error)) from error
         request["updated_at"] = int(self.clock())
-        self.ledger.record_request(request, event="denied", actor=actor)
+        self.ledger.record_request(request,event="denied",actor=actor,metadata={**dict(challenge),"decision":"deny"})
         return request
 
     def set_control(self, key: str, value: Any, *, actor: str):

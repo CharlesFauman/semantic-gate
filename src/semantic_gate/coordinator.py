@@ -40,6 +40,7 @@ class CoreBackend:
     def __init__(self, policy: dict, *, approval_key: bytes, clock, notifier=None):
         self.clock = clock
         self.verifier = HostApprovalVerifier(approval_key)
+        self._decision_challenges: dict[str,dict] = {}
         registry = ToolRegistry()
         actions = set(policy["workflows"])
 
@@ -64,7 +65,20 @@ class CoreBackend:
         return self.engine.explain_action(action, principal=principal)
 
     def request_action(self, **kwargs):
-        return self.engine.request_action(**kwargs)
+        request=self.engine.request_action(**kwargs)
+        if request.get("state")=="waiting_for_approval":
+            approval=next(gate for gate in request["gates"] if gate["kind"]=="approval" and gate["status"]=="waiting")
+            challenge=self._decision_challenges.get(request["request_id"])
+            if challenge is None:
+                challenge={
+                    "request_id":request["request_id"],
+                    "request_hash":request["request_hash"],
+                    "approval_gate_id":approval["id"],
+                    "expires_at":int(self.clock())+int(approval["evidence"]["ttl_seconds"]),
+                }
+                self._decision_challenges[request["request_id"]]=challenge
+            request["approval_challenge"]=dict(challenge)
+        return request
 
     def get_request(self, request_id: str, requester: str | None = None):
         if requester is None:
@@ -81,13 +95,9 @@ class CoreBackend:
         if not isinstance(challenge, dict) or set(challenge) != {"request_id", "request_hash", "approval_gate_id", "expires_at"}:
             raise ApprovalRejected("decision challenge is incomplete")
         approval = next(gate for gate in request["gates"] if gate["kind"] == "approval" and gate["status"] == "waiting")
-        ttl = int(approval["evidence"]["ttl_seconds"])
-        expected = {
-            "request_id": request_id,
-            "request_hash": request["request_hash"],
-            "approval_gate_id": approval["id"],
-            "expires_at": int(request["created_at"]) + ttl,
-        }
+        expected = self._decision_challenges.get(request_id)
+        if expected is None:
+            raise ApprovalRejected("decision challenge is unavailable")
         if challenge != expected:
             raise ApprovalRejected("decision challenge does not match the waiting request")
         if challenge["expires_at"] <= int(self.clock()):
@@ -109,11 +119,13 @@ class CoreBackend:
             "expires_at": challenge["expires_at"],
         }
         evidence["signature"] = self.verifier.sign(evidence)
-        return self.engine.ingest_trusted_approval(request_id, evidence)
+        decided=self.engine.ingest_trusted_approval(request_id,evidence)
+        self._decision_challenges.pop(request_id,None)
+        return decided
 
     def deny_request(self, request_id: str, actor: str, challenge: dict):
         request, approval = self._decision(request_id, challenge)
-        return self.engine.ingest_trusted_denial(request_id, {
+        decided=self.engine.ingest_trusted_denial(request_id, {
             "request_id": request_id,
             "request_hash": request["request_hash"],
             "approval_gate_id": approval["id"],
@@ -122,3 +134,5 @@ class CoreBackend:
             "expires_at": challenge["expires_at"],
             "decided_at": int(self.clock()),
         })
+        self._decision_challenges.pop(request_id,None)
+        return decided

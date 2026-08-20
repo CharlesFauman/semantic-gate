@@ -149,6 +149,19 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"stale"):
             self.ledger.complete_notification(stale["notification_id"],claim_token=stale_claim["claim_token"],delivered_at=206)
 
+    def test_notification_status_is_queryable_by_exact_request_and_migrations_never_downgrade(self):
+        first=self.ledger.enqueue_notification(request_id="req_status",request_hash="e"*64,notify_gate_id="notify",recipient="owner",template_hash="f"*64,now=10)
+        self.ledger.enqueue_notification(request_id="req_other",request_hash="1"*64,notify_gate_id="notify",recipient="owner",template_hash="2"*64,now=11)
+        self.assertEqual([first],self.ledger.notifications_for_request("req_status"))
+        self.ledger._db.execute("PRAGMA user_version=7")
+        self.ledger._db.commit()
+        self.ledger.close()
+        reopened=Ledger(self.path)
+        try:
+            self.assertEqual(7,reopened.schema_version())
+        finally:
+            reopened.close()
+
     def test_concurrent_outbox_claim_has_one_winner(self):
         self.ledger.enqueue_notification(request_id="req_race",request_hash="e"*64,notify_gate_id="notify",recipient="owner",template_hash="f"*64,now=1)
         other=Ledger(self.path); barrier=__import__("threading").Barrier(2); results=[]; errors=[]

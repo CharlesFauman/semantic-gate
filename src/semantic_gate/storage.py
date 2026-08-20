@@ -76,8 +76,10 @@ class Ledger:
           last_error TEXT,
           UNIQUE(request_id,request_hash,notify_gate_id,recipient,template_hash)
         );
-        PRAGMA user_version=1;
         """)
+        current_version=int(self._db.execute("PRAGMA user_version").fetchone()[0])
+        if current_version == 0:
+            self._db.execute("PRAGMA user_version=1")
         self._db.commit()
 
     @staticmethod
@@ -102,6 +104,16 @@ class Ledger:
         with self._lock:
             row=self._db.execute("SELECT * FROM notification_outbox WHERE notification_id=?",(notification_id,)).fetchone()
         return self._notification(row)
+
+    def notifications_for_request(self, request_id: str) -> list[dict]:
+        if not isinstance(request_id,str) or not request_id:
+            raise ValueError("request_id must be a non-empty string")
+        with self._lock:
+            rows=self._db.execute(
+                "SELECT * FROM notification_outbox WHERE request_id=? ORDER BY created_at,notification_id",
+                (request_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def enqueue_notification(self, *, request_id: str, request_hash: str, notify_gate_id: str, recipient: str, template_hash: str, now: int) -> dict:
         binding=(request_id,request_hash,notify_gate_id,recipient,template_hash)
