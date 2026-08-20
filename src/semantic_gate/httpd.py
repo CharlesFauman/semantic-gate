@@ -79,7 +79,7 @@ def compose(args, *, master_key: bytes, approval_key: bytes, admin_password: str
     backend=CoreBackend(build_policy(catalog,principals),approval_key=approval_key,clock=clock,
                         auto_approval=auto_approval,catalog=catalog)
     ledger=Ledger(args.database); ledger.expire_unresolved(now=int(clock()))
-    app=SemanticGateApplication(GateControl(backend,ledger,clock=clock),CapabilityAuthority(master_key,principals),CredentialRegistry(args.credentials),catalog=catalog,admin_password=admin_password,admin_principal_id=args.admin_principal,origins=[args.origin],clock=clock)
+    app=SemanticGateApplication(GateControl(backend,ledger,clock=clock),CapabilityAuthority(master_key,principals),CredentialRegistry(args.credentials),catalog=catalog,admin_password=admin_password,admin_principal_id=args.admin_principal,origins=[args.origin],clock=clock,principal_contexts=principals)
     return app,ledger
 
 

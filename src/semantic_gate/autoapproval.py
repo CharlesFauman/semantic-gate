@@ -449,7 +449,7 @@ def _rule_failure(rule: Mapping[str, Any], request: Mapping[str, Any], *, now: i
 def evaluate(request: Any, *, policy: AutoApprovalPolicy, now: int, node: str | None = None,
              policy_version: int | None = None, paused: bool = False, disabled_rules=(),
              path_resolver: Callable[[str], bool] | None = None, catalogue: Any = None,
-             execution_enabled: bool = False) -> dict:
+             execution_enabled: bool = False, approval_binding: Mapping[str, Any] | None = None) -> dict:
     """Deterministically decide whether one exact request is auto-approvable.
 
     `node` is the host-authenticated node identity. It is never taken from an
@@ -469,7 +469,7 @@ def evaluate(request: Any, *, policy: AutoApprovalPolicy, now: int, node: str | 
         return _decision("policy_version_stale")
     if request.get("state") != "waiting_for_approval":
         return _decision("request_not_waiting")
-    challenge = request.get("approval_challenge")
+    challenge = approval_binding if approval_binding is not None else request.get("approval_challenge")
     if not isinstance(challenge, Mapping) or type(challenge.get("expires_at")) is not int or challenge["expires_at"] <= now:
         return _decision("challenge_unavailable")
     if challenge.get("request_id") != request.get("request_id") or challenge.get("request_hash") != request.get("request_hash"):

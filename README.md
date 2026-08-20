@@ -100,6 +100,13 @@ through the gateway directly.
   host-authenticated requester/node, closed parameter constraints and a commit
   identity. Rules are host-owned; agents cannot create, edit, enable, disable or
   pause them.
+- **Synchronous automatic decisions:** for `automatic` catalogue entries, MCP and
+  HTTP `request_action` return the terminal simulated/auto-approved result in the
+  same call. External notification I/O is deferred and cannot delay or fail that
+  policy decision. `human_communication` and `human_spending` remain the only
+  approval waits; prohibited entries remain closed.
+- **Host-owned node binding:** MCP/HTTP node identity comes from the authenticated
+  principal's checked-in `node` configuration, never caller context or parameters.
 - **Auto-approval is not execution:** matched requests still pass schema
   validation, prechecks, the approval gate, the post-approval recheck and
   single-request evidence/audit. `execution_enabled=false` remains a separate

@@ -58,7 +58,12 @@ access to the downstream effectful tools that Semantic Gate is meant to gate.
     arrays. The standing rule additionally requires `execution_enabled=false`;
     catalogue membership is enforced, and there is no wildcard that bypasses
     it.
-22. Decision-card projection is closed and bounded. Only action-schema-owned
+22. Automatic standing-policy decisions are synchronous at the MCP/HTTP
+    boundary. External notifier I/O is not invoked before their bound policy
+    decision and cannot delay or fail it. Trusted node identity is derived from
+    authenticated principal configuration, never caller context. Human
+    communication and spending keep delivery-anchored human challenges.
+23. Decision-card projection is closed and bounded. Only action-schema-owned
     presentation fields are projected, sanitized to a printable allowlist,
     length-bounded and escaped. A changed commit voids auto-approval evidence.
 

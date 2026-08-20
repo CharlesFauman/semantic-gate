@@ -2,6 +2,7 @@
 """Transport-independent policy controller around Semantic Gate."""
 from __future__ import annotations
 import re
+import threading
 
 from typing import Any, Mapping
 
@@ -27,6 +28,7 @@ class GateControl:
         self.backend = backend
         self.ledger = ledger
         self.clock = clock
+        self._request_lock = threading.RLock()
 
     def _attach_approval_challenge(self,request: dict) -> dict:
         if request.get("state") != "waiting_for_approval" or "approval_challenge" in request:
@@ -74,6 +76,10 @@ class GateControl:
         return self.backend.explain_action(action, principal)
 
     def request_action(self, *, principal: str, payload: Mapping[str, Any], host_context: Mapping[str, Any]):
+        with self._request_lock:
+            return self._request_action(principal=principal, payload=payload, host_context=host_context)
+
+    def _request_action(self, *, principal: str, payload: Mapping[str, Any], host_context: Mapping[str, Any]):
         data = self._payload(payload)
         self._allowed(principal, data["action"])
         request = self.backend.request_action(
@@ -85,6 +91,9 @@ class GateControl:
             idempotency_key=data["idempotency_key"],
             minimum_control=data["minimum_control"],
         )
+        prior = self.ledger.get_request(request["request_id"])
+        if prior is not None and prior.get("request_hash") == request.get("request_hash"):
+            return prior
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
         self._attach_approval_challenge(request)
@@ -92,6 +101,12 @@ class GateControl:
         self.ledger.record_request(request, event="requested", actor=principal)
         if decision is not None and decision.get("matched"):
             return self._apply_auto_approval(request, decision)
+        project = getattr(self.backend, "project_deferred_notification", None)
+        if project is not None:
+            challenge = project(request["request_id"])
+            if challenge is not None:
+                request["approval_challenge"] = challenge
+                self.ledger.record_request(request, event="notification_delivered", actor="host:notifier")
         return request
 
     def _auto_approval_dry_run(self, request: dict) -> dict | None:
@@ -122,7 +137,9 @@ class GateControl:
         decided["updated_at"] = int(self.clock())
         decided.pop("trusted_context", None)
         decided["auto_approval"] = {**request["auto_approval"], "rule_id": audit.get("rule_id"),
-                                    "rule_version": audit.get("rule_version"), "authorizes_execution": False}
+                                    "rule_version": audit.get("rule_version"),
+                                    "request_id": decided["request_id"], "request_hash": decided["request_hash"],
+                                    "authorizes_execution": False}
         self.ledger.record_request(decided, event="auto_approved", actor="policy:auto-approval", metadata=audit)
         return decided
 

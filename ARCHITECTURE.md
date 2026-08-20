@@ -154,8 +154,15 @@ shared guards (policy enabled, human pause, policy version, waiting state,
 The coordinator owns the authoritative catalogue and passes it, together with
 the live policy `execution_enabled` flag, into every evaluation; it re-evaluates
 at ingestion time, so a scope or commit change between match and ingestion voids
-the evidence. Approval evidence carries `authorizes_execution: false`; execution
-still requires enabling policy and a host-owned `ExecutionAuthority`.
+the evidence. MCP and HTTP derive trusted node identity from authenticated
+principal configuration; caller context cannot select it. For `automatic`
+catalogue entries under the standing simulation rule, notification projection
+is deferred while the exact policy-only approval binding is derived from the
+request ID/hash, waiting approval gate and TTL. The same MCP/HTTP call therefore
+returns the terminal simulated result even when the external notifier is down.
+Human communication and spending retain delivery-anchored decision challenges.
+Approval evidence carries `authorizes_execution: false`; execution still requires
+enabling policy and a host-owned `ExecutionAuthority`.
 
 ### Decision-card projection and panel feeds
 

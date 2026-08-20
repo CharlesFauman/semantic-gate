@@ -9,7 +9,7 @@ import secrets
 from typing import Any
 
 from . import autoapproval
-from .catalog import validate_catalog
+from .catalog import action_gate_class, validate_catalog
 from .engine import ApprovalRejected, GatewayEngine, RecordingNotifier, ToolRegistry
 
 
@@ -37,6 +37,35 @@ class HostApprovalVerifier:
                 and hmac.compare_digest(supplied,self.sign(evidence)))
 
 
+class _PolicyProjectionNotifier:
+    """Keep automatic policy decisions independent of external notification I/O."""
+    def __init__(self, delegate, *, catalog, auto_approval, simulation_only):
+        self.delegate = delegate
+        self.catalog = catalog
+        self.auto_approval = auto_approval
+        self.simulation_only = simulation_only
+        self.simulated = RecordingNotifier()
+        self.deferred: dict[str, tuple[dict, dict]] = {}
+
+    def notify(self, request: dict, gate: dict) -> dict:
+        standing = self.auto_approval is not None and self.auto_approval.global_simulation_rule is not None
+        gate_class = action_gate_class((self.catalog.get("actions") or {}).get(request.get("action"))) if self.catalog is not None else None
+        if self.simulation_only and standing and gate_class == "automatic":
+            self.deferred[request["request_id"]] = (dict(request), dict(gate))
+            return self.simulated.notify(request, gate)
+        return self.delegate.notify(request, gate)
+
+    def discard(self, request_id: str) -> None:
+        self.deferred.pop(request_id, None)
+
+    def project(self, request_id: str) -> dict | None:
+        pending = self.deferred.pop(request_id, None)
+        if pending is None:
+            return None
+        request, gate = pending
+        return self.delegate.notify(request, gate)
+
+
 class CoreBackend:
     APPROVAL_ABSOLUTE_CAP_SECONDS = 6 * 60 * 60
     TERMINAL_STATES = frozenset({"blocked", "cancelled", "simulated", "executed", "failed", "expired", "denied"})
@@ -51,6 +80,10 @@ class CoreBackend:
         self._auto_approval_path_resolver = auto_approval_path_resolver
         self._decision_challenges: dict[str,dict] = {}
         self._trusted_nodes: dict[str,str] = {}
+        self._external_notifier = notifier if notifier is not None else RecordingNotifier()
+        self._projection_notifier = _PolicyProjectionNotifier(
+            self._external_notifier, catalog=self.catalog, auto_approval=self.auto_approval,
+            simulation_only=policy.get("mode") == "simulation_only" and policy.get("execution_enabled") is False)
         registry = ToolRegistry()
         actions = set(policy["workflows"])
 
@@ -62,7 +95,7 @@ class CoreBackend:
         self.engine = GatewayEngine(
             policy,
             registry=registry,
-            notifier=notifier or RecordingNotifier(),
+            notifier=self._projection_notifier,
             approval_verifier=self.verifier,
             execution_authority=None,
             clock=self.clock,
@@ -77,6 +110,7 @@ class CoreBackend:
         """Purge challenge and trusted-node bindings for one request."""
         self._decision_challenges.pop(request_id, None)
         self._trusted_nodes.pop(request_id, None)
+        self._projection_notifier.discard(request_id)
 
     def _observe_state(self, request: dict) -> dict:
         """Purge binding state whenever a terminal or expired request is observed."""
@@ -145,6 +179,29 @@ class CoreBackend:
         challenge = self.approval_challenge(request["request_id"])
         return request if challenge is None else {**request, "approval_challenge": challenge}
 
+    def _policy_approval_binding(self, request: dict) -> dict | None:
+        if request.get("state") != "waiting_for_approval":
+            return None
+        approval = next((gate for gate in request.get("gates", ())
+                         if gate.get("kind") == "approval" and gate.get("status") == "waiting"), None)
+        ttl = ((approval or {}).get("evidence") or {}).get("ttl_seconds")
+        if approval is None or type(request.get("created_at")) is not int or type(ttl) is not int:
+            return None
+        expires_at = request["created_at"] + min(ttl, self.APPROVAL_ABSOLUTE_CAP_SECONDS)
+        if expires_at <= int(self.clock()):
+            return None
+        return {"request_id": request["request_id"], "request_hash": request["request_hash"],
+                "approval_gate_id": approval["id"], "expires_at": expires_at}
+
+    def project_deferred_notification(self, request_id: str) -> dict | None:
+        """Best-effort human projection after policy declined an automatic candidate."""
+        try:
+            event = self._projection_notifier.project(request_id)
+        except Exception:
+            return None
+        delivered_at = event.get("delivered_at") if isinstance(event, dict) and event.get("delivered") is True else None
+        return self.mark_notification_delivered(request_id, delivered_at=delivered_at) if type(delivered_at) is int else None
+
     def auto_approval_decision(self, request: dict, *, node: str | None = None, paused: bool = False, disabled_rules=()) -> dict | None:
         """Dry-runnable, side-effect-free auto-approval evaluation for one exact request."""
         if self.auto_approval is None:
@@ -160,6 +217,7 @@ class CoreBackend:
             path_resolver=self._auto_approval_path_resolver,
             catalogue=self.catalog,
             execution_enabled=self.execution_enabled,
+            approval_binding=self._policy_approval_binding(request) or {},
         )
 
     def auto_approve(self, request_id: str, decision: dict, *, node: str | None = None) -> tuple[dict, dict, dict]:

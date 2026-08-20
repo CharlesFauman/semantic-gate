@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import html
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http import cookies
@@ -160,9 +161,10 @@ class SemanticGateApplication:
     FEED_LABELS = {"decisions":"Gate decisions","denials":"Policy denials","gate_errors":"Gate errors",
                    "withdrawn":"Withdrawn or expired","telemetry":"Execution telemetry"}
 
-    def __init__(self, control: GateControl, authority: CapabilityAuthority, credentials: CredentialRegistry, *, catalog: Mapping[str, Any], admin_password: str, admin_principal_id: str = "control", origins: Sequence[str], clock, secure_cookies: bool = True, status_provider=None):
+    def __init__(self, control: GateControl, authority: CapabilityAuthority, credentials: CredentialRegistry, *, catalog: Mapping[str, Any], admin_password: str, admin_principal_id: str = "control", origins: Sequence[str], clock, secure_cookies: bool = True, status_provider=None, principal_contexts: Mapping[str, Mapping[str, Any]] | None = None):
         self.control=control; self.authority=authority; self.credentials=credentials
         self.catalog=dict(catalog); self.admin_password=admin_password; self.admin_principal_id=admin_principal_id; self.clock=clock; self.secure_cookies=secure_cookies
+        self.principal_contexts={str(key):dict(value) for key,value in (principal_contexts or {}).items()}
         self.status_provider=status_provider or (lambda:{})
         self.origins=frozenset(origin.rstrip("/") for origin in origins)
         if not self.origins or any(urlsplit(origin).scheme not in {"http","https"} or not urlsplit(origin).netloc or urlsplit(origin).path for origin in self.origins):
@@ -448,6 +450,15 @@ class SemanticGateApplication:
               "<button type=submit>Sign in</button></form></main></body></html>").format(css=_LOGIN_CSS)
         return Response(200,{"Content-Type":"text/html;charset=UTF-8","Cache-Control":"no-store"},page.encode())
 
+    def _host_context(self, principal: Principal, surface: str) -> dict:
+        context = {"surface": surface, "authenticated_principal": principal.principal_id}
+        node = self.principal_contexts.get(principal.principal_id, {}).get("node")
+        if node is not None:
+            if not isinstance(node, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}", node):
+                raise GateControlError("principal node binding is invalid")
+            context["node"] = node
+        return context
+
     def _mcp(self, principal: Principal, message: dict) -> Response:
         request_id=message.get("id"); method=message.get("method"); params=message.get("params",{})
         try:
@@ -460,7 +471,7 @@ class SemanticGateApplication:
                 if not isinstance(args,dict): raise GateControlError("tool arguments must be an object")
                 if name=="list_actions": value=self.control.list_actions(principal.principal_id)
                 elif name=="explain_action": value=self.control.explain_action(args.get("action"),principal.principal_id)
-                elif name=="request_action": value=self.control.request_action(principal=principal.principal_id,payload=args,host_context={"surface":"mcp","authenticated_principal":principal.principal_id})
+                elif name=="request_action": value=self.control.request_action(principal=principal.principal_id,payload=args,host_context=self._host_context(principal,"mcp"))
                 elif name=="get_request": value=self.control.get_request(args.get("request_id"),principal=principal.principal_id)
                 elif name=="cancel_request": value=self.control.cancel(args.get("request_id"),principal=principal.principal_id)
                 else: raise GateControlError("unknown MCP tool")
@@ -503,7 +514,7 @@ class SemanticGateApplication:
             if route=="/api/v1/audit-observations" and method=="POST":
                 p=self._bearer(headers); return _json(200,self.control.observe(principal=p.principal_id,payload=self._decode(body)))
             if route=="/api/v1/requests" and method=="POST":
-                p=self._action_bearer(headers); return _json(201,self.control.request_action(principal=p.principal_id,payload=self._decode(body),host_context={"surface":"http","authenticated_principal":p.principal_id}))
+                p=self._action_bearer(headers); return _json(201,self.control.request_action(principal=p.principal_id,payload=self._decode(body),host_context=self._host_context(p,"http")))
             if route=="/api/v1/requests" and method=="GET":
                 p=self._action_bearer(headers); return _json(200,self.control.list_requests(principal=p.principal_id))
             if route.startswith("/api/v1/requests/"):

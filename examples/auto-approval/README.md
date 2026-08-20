@@ -20,6 +20,10 @@
   shrink nor extend it. Caller parameters can only fail a request toward the
   human gate (recursive secret, command and destructive-parameter screening
   through nested objects and arrays), never away from it.
+- MCP and HTTP return a terminal simulated result for `automatic` entries in the
+  same `request_action` call. External notifier delivery is deferred until after
+  the bound policy decision and cannot gate it. The host binds each authenticated
+  principal to its trusted `node`; caller context cannot choose that identity.
 - `rules` holds scoped rules for the later execution-enabled promotion path. Each
   binds one canonical repository, exact refs, declared deploy target/environment,
   host-authenticated requesters/nodes, closed parameter constraints and a review
