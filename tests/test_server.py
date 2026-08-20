@@ -19,11 +19,12 @@ class FakeBackend:
     def list_actions(self, principal): return [{"action":"device.power_off"}]
     def explain_action(self, action, principal): return {"action":action,"execution_enabled":False}
     def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key, minimum_control="policy"):
-        request={"request_id":"req_1","request_hash":"h","action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"policy_control":"ask","effective_control":"step_up" if minimum_control=="step_up" else "ask","gates":[]}
+        request={"request_id":"req_1","request_hash":"h"*64,"action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"policy_control":"ask","effective_control":"step_up" if minimum_control=="step_up" else "ask","gates":[{"id":"approval","kind":"approval","status":"waiting","evidence":{"ttl_seconds":300}}]}
         self.requests[request["request_id"]]=request; return dict(request)
     def get_request(self, request_id, requester=None): return dict(self.requests[request_id])
     def cancel_request(self, request_id, requester): self.requests[request_id]["state"]="cancelled"; return dict(self.requests[request_id])
-    def approve_request(self, request_id, actor, assurance="ask"): self.requests[request_id]["state"]="simulated"; return dict(self.requests[request_id])
+    def approve_request(self, request_id, actor, challenge): self.requests[request_id]["state"]="simulated"; return dict(self.requests[request_id])
+    def deny_request(self, request_id, actor, challenge): self.requests[request_id]["state"]="denied"; return dict(self.requests[request_id])
 
 
 class SemanticGateApplicationTests(unittest.TestCase):
@@ -91,7 +92,13 @@ class SemanticGateApplicationTests(unittest.TestCase):
         request=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"two"}).json()
         self.assertEqual(403,self.call("POST",f"/admin/requests/{request['request_id']}/approve",{"Cookie":cookie},{}).status)
         headers={"Cookie":cookie,"Origin":"https://control.example","X-CSRF-Token":csrf}
-        self.assertEqual("simulated",self.call("POST",f"/admin/requests/{request['request_id']}/approve",headers,{}).json()["state"])
+        self.assertEqual(409,self.call("POST",f"/admin/requests/{request['request_id']}/approve",headers,{}).status)
+        approved=self.call("POST",f"/admin/requests/{request['request_id']}/approve",headers,request["approval_challenge"])
+        self.assertEqual("simulated",approved.json()["state"])
+        self.assertEqual(409,self.call("POST",f"/admin/requests/{request['request_id']}/approve",headers,request["approval_challenge"]).status)
+        terminal_panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertNotIn("data-id='req_1' data-op='approve'",terminal_panel)
+        self.assertNotIn("data-id='req_1' data-op='deny'",terminal_panel)
         paused=self.call("POST","/admin/controls",headers,{"key":"pause_all","value":True})
         self.assertTrue(paused.json()["pause_all"])
         loopback={"Cookie":cookie,"Origin":"http://127.0.0.1:18790","X-CSRF-Token":csrf}
@@ -135,8 +142,12 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertNotIn("Please confirm <exact> parts & warranty.",text)
         self.assertIn("LIST-123",text)
         self.assertIn("requirements.pdf",text)
-        self.assertNotIn("Canonical request parameters",text)
-        self.assertNotIn('&quot;details&quot;',text)
+        self.assertIn("Canonical normalized parameters",text)
+        self.assertIn('&quot;details&quot;',text)
+        self.assertIn("Request hash",text)
+        self.assertIn("h"*64,text)
+        self.assertIn("Approval expires at",text)
+        self.assertIn("If this request expires, submit a new proposal",text)
 
     def test_http_json_rejects_non_finite_values(self):
         response=self.app.handle("POST","/api/v1/requests",self.agent,b'{"action":"device.power_off","parameters":{"x":NaN},"context":{},"idempotency_key":"nan"}')

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from semantic_gate.controller import GateControl, GateControlError
+from semantic_gate.controller import GateControl, GateControlError, GateDecisionConflict
 from semantic_gate.storage import Ledger
 
 
@@ -22,7 +22,7 @@ class FakeBackend:
 
     def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key, minimum_control="policy"):
         self.calls.append((action, requester, trusted_context, minimum_control))
-        request = {"request_id":f"req_{len(self.calls)}","request_hash":"h","action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"gates":[]}
+        request = {"request_id":f"req_{len(self.calls)}","request_hash":"h"*64,"action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"gates":[{"id":"approve","kind":"approval","status":"waiting","evidence":{"ttl_seconds":300}}]}
         self.requests[request["request_id"]] = request
         return dict(request)
 
@@ -33,8 +33,12 @@ class FakeBackend:
         self.requests[request_id]["state"] = "cancelled"
         return dict(self.requests[request_id])
 
-    def approve_request(self, request_id, actor, assurance="ask"):
+    def approve_request(self, request_id, actor, challenge):
         self.requests[request_id]["state"] = "simulated"
+        return dict(self.requests[request_id])
+
+    def deny_request(self, request_id, actor, challenge):
+        self.requests[request_id]["state"] = "denied"
         return dict(self.requests[request_id])
 
 
@@ -84,11 +88,24 @@ class GateControlTests(unittest.TestCase):
     def test_only_admin_transport_can_approve_and_simulation_stays_non_effectful(self):
         request = self.control.request_action(principal="hermes-mac", payload={"action":"home.tv.power_off","parameters":{},"context":{},"idempotency_key":"a"}, host_context={})
         with self.assertRaisesRegex(GateControlError, "admin"):
-            self.control.approve(request["request_id"], actor="hermes-mac", actor_role="agent")
-        result = self.control.approve(request["request_id"], actor="control-panel", actor_role="admin")
+            self.control.approve(request["request_id"], actor="hermes-mac", actor_role="agent", challenge=request["approval_challenge"])
+        result = self.control.approve(request["request_id"], actor="control-panel", actor_role="admin", challenge=request["approval_challenge"])
         self.assertEqual("simulated", result["state"])
         self.assertFalse(result.get("execution_possible", False))
         self.assertEqual(["requested", "approved"], [event["event"] for event in self.ledger.audit_events(request["request_id"])])
+
+    def test_decisions_require_the_exact_unexpired_challenge_and_are_single_use(self):
+        request=self.control.request_action(principal="hermes-mac",payload={"action":"home.tv.power_off","parameters":{},"context":{},"idempotency_key":"challenge"},host_context={})
+        exact=request["approval_challenge"]
+        for challenge in ({},{**exact,"request_hash":"0"*64},{**exact,"approval_gate_id":"other"},{**exact,"expires_at":401}):
+            with self.subTest(challenge=challenge),self.assertRaises(GateDecisionConflict):
+                self.control.deny(request["request_id"],actor="control-panel",actor_role="admin",challenge=challenge)
+        denied=self.control.deny(request["request_id"],actor="control-panel",actor_role="admin",challenge=exact)
+        self.assertEqual("denied",denied["state"])
+        before=self.ledger.audit_events(request["request_id"])
+        with self.assertRaises(GateDecisionConflict):
+            self.control.approve(request["request_id"],actor="control-panel",actor_role="admin",challenge=exact)
+        self.assertEqual(before,self.ledger.audit_events(request["request_id"]))
 
     def test_persisted_terminal_request_remains_readable_after_backend_restart(self):
         request={"request_id":"old","request_hash":"h","action":"home.tv.power_off","requester":"hermes-mac","state":"expired","created_at":1,"updated_at":2,"parameters":{},"context":{},"gates":[]}

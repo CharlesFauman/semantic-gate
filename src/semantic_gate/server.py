@@ -12,7 +12,7 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from .auth import AuthError, CapabilityAuthority, Principal
-from .controller import GateControl, GateControlError
+from .controller import GateControl, GateControlError, GateDecisionConflict
 from .credentials import CredentialRegistry
 from .engine import GatePolicyError, _validate_json_value
 
@@ -57,8 +57,19 @@ def _request_review(request: Mapping[str, Any]) -> str:
     )))
     message=details.get("body")
     message_html=f"<h4>Message body</h4><pre class=message>{html.escape(message)}</pre>" if isinstance(message,str) and message else ""
+    canonical=json.dumps(parameters,ensure_ascii=False,sort_keys=True,separators=(",", ":"),allow_nan=False)
+    raw_challenge=request.get("approval_challenge")
+    challenge=raw_challenge if isinstance(raw_challenge,Mapping) else {}
+    expiry=challenge.get("expires_at","")
+    binding=(
+        "<h4>Canonical normalized parameters</h4>"
+        f"<pre>{html.escape(canonical)}</pre>"
+        f"<dl><dt>Request hash</dt><dd><code>{html.escape(str(request.get('request_hash','')))}</code></dd>"
+        f"<dt>Approval expires at</dt><dd>{html.escape(str(expiry))}</dd></dl>"
+        "<p>If this request expires, submit a new proposal; never reuse an old decision.</p>"
+    )
     open_attr=" open" if request.get("state")=="waiting_for_approval" else ""
-    return f"<details class=request-review{open_attr}><summary>Review exact request</summary><dl>{fields}</dl>{message_html}</details>"
+    return f"<details class=request-review{open_attr}><summary>Review exact request</summary><dl>{fields}</dl>{message_html}{binding}</details>"
 
 
 MCP_TOOLS = [
@@ -123,11 +134,17 @@ class SemanticGateApplication:
         controls=self.control.ledger.controls(); actions=self.catalog.get("actions",{})
         audits=self.control.ledger.audit_events(limit=200)
         def decision_buttons(item: Mapping[str,Any]) -> str:
+            if item.get("state") != "waiting_for_approval":
+                return "<span>Decision recorded; controls unavailable.</span>"
             request_id=html.escape(str(item["request_id"]))
-            deny=f"<button data-id='{request_id}' data-op='deny'>Deny</button>"
+            challenge=item.get("approval_challenge")
+            if not isinstance(challenge,Mapping):
+                return "<span>Decision unavailable; refresh or submit a new proposal.</span>"
+            encoded=html.escape(json.dumps(dict(challenge),sort_keys=True,separators=(",", ":")),quote=True)
+            deny=f"<button data-id='{request_id}' data-op='deny' data-challenge='{encoded}'>Deny</button>"
             if item.get("effective_control")=="step_up":
                 return "<button disabled>Step-up required</button> "+deny
-            return f"<button data-id='{request_id}' data-op='approve'>Approve once</button> "+deny
+            return f"<button data-id='{request_id}' data-op='approve' data-challenge='{encoded}'>Approve once</button> "+deny
         rows="".join(
             f"<tr><td>{html.escape(r['request_id'])}</td><td>{html.escape(r['action'])}</td><td>{html.escape(r['requester'])}</td>"
             f"<td>{html.escape(str(r.get('policy_control','policy')))}</td><td>{html.escape(str(r.get('minimum_control','policy')))}</td>"
@@ -138,7 +155,7 @@ class SemanticGateApplication:
         cred_rows="".join(f"<tr><td>{html.escape(c['credential_id'])}</td><td>{html.escape(c['adapter'])}</td><td>{html.escape(c['status'])}</td></tr>" for c in self.credentials.public_inventory())
         audit_rows="".join(f"<tr><td>{a['seq']}</td><td>{html.escape(str(a['event']))}</td><td>{html.escape(str(a['actor']))}</td><td>{html.escape(str(a.get('request_id') or ''))}</td><td>{a['at']}</td></tr>" for a in audits)
         csrf=self._csrf(session)
-        page=f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><meta name=csrf content='{csrf}'><title>Semantic Gate</title><style>body{{font:15px system-ui;background:#0b1020;color:#edf2ff;margin:0}}main{{max-width:1500px;margin:auto;padding:20px}}section{{background:#151c31;border:1px solid #2b3658;border-radius:14px;padding:16px;margin:14px 0;overflow:auto}}table{{border-collapse:collapse;width:100%}}td,th{{padding:9px;border-bottom:1px solid #2b3658;text-align:left;vertical-align:top}}button{{background:#6ea8fe;color:#07101f;border:0;border-radius:8px;padding:8px;margin:3px}}button.danger{{background:#ff7b72}}code{{color:#9bdcff}}.safe{{color:#85e89d}}.request-review{{min-width:min(620px,75vw)}}.request-review>summary{{font-weight:700;color:#9bdcff;cursor:pointer;padding:8px 0}}dl{{display:grid;grid-template-columns:max-content minmax(220px,1fr);gap:6px 12px}}dt{{color:#aab6d3;font-weight:700}}dd{{margin:0;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1020;border:1px solid #2b3658;border-radius:8px;padding:10px}}pre.message{{font:14px/1.45 system-ui}}</style><main><h1>Semantic Gate</h1><p class=safe>Execution is globally disabled; decisions simulate only.</p><section><h2>Emergency controls</h2><button class=danger data-control=pause_all data-value=true>Pause all</button><button data-control=pause_all data-value=false>Resume proposals</button><button data-list=paused_domains>Set paused domains</button><button data-list=revoked_principals>Set revoked principals</button><pre>{html.escape(json.dumps(controls,indent=2))}</pre></section><section><h2>Requests</h2><table><tr><th>ID</th><th>Action</th><th>Principal</th><th>Policy control</th><th>Caller floor</th><th>Effective control</th><th>State</th><th>Exact request</th><th>Decision</th></tr>{rows}</table></section><section><h2>Credential bindings</h2><table>{cred_rows}</table></section><section><h2>Action catalogue</h2><table><tr><th>Action</th><th>Risk</th><th>Effect</th><th>Summary</th></tr>{action_rows}</table></section><section><h2>Audit</h2><table><tr><th>#</th><th>Event</th><th>Actor</th><th>Request</th><th>Time</th></tr>{audit_rows}</table></section></main><script>document.addEventListener('click',async e=>{{let path,body={{}};if(e.target.dataset.op)path='/admin/requests/'+e.target.dataset.id+'/'+e.target.dataset.op;else if(e.target.dataset.control){{path='/admin/controls';body={{key:e.target.dataset.control,value:e.target.dataset.value==='true'}}}}else if(e.target.dataset.list){{path='/admin/controls';let raw=prompt('Comma-separated values (empty clears):','');if(raw===null)return;body={{key:e.target.dataset.list,value:raw.split(',').map(x=>x.trim()).filter(Boolean)}}}}else return;let r=await fetch(path,{{method:'POST',headers:{{'Origin':location.origin,'X-CSRF-Token':document.querySelector('meta[name=csrf]').content,'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(r.ok)location.reload();else alert(await r.text())}})</script>"""
+        page=f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><meta name=csrf content='{csrf}'><title>Semantic Gate</title><style>body{{font:15px system-ui;background:#0b1020;color:#edf2ff;margin:0}}main{{max-width:1500px;margin:auto;padding:20px}}section{{background:#151c31;border:1px solid #2b3658;border-radius:14px;padding:16px;margin:14px 0;overflow:auto}}table{{border-collapse:collapse;width:100%}}td,th{{padding:9px;border-bottom:1px solid #2b3658;text-align:left;vertical-align:top}}button{{background:#6ea8fe;color:#07101f;border:0;border-radius:8px;padding:8px;margin:3px}}button.danger{{background:#ff7b72}}code{{color:#9bdcff}}.safe{{color:#85e89d}}.request-review{{min-width:min(620px,75vw)}}.request-review>summary{{font-weight:700;color:#9bdcff;cursor:pointer;padding:8px 0}}dl{{display:grid;grid-template-columns:max-content minmax(220px,1fr);gap:6px 12px}}dt{{color:#aab6d3;font-weight:700}}dd{{margin:0;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1020;border:1px solid #2b3658;border-radius:8px;padding:10px}}pre.message{{font:14px/1.45 system-ui}}</style><main><h1>Semantic Gate</h1><p class=safe>Execution is globally disabled; decisions simulate only.</p><section><h2>Emergency controls</h2><button class=danger data-control=pause_all data-value=true>Pause all</button><button data-control=pause_all data-value=false>Resume proposals</button><button data-list=paused_domains>Set paused domains</button><button data-list=revoked_principals>Set revoked principals</button><pre>{html.escape(json.dumps(controls,indent=2))}</pre></section><section><h2>Requests</h2><table><tr><th>ID</th><th>Action</th><th>Principal</th><th>Policy control</th><th>Caller floor</th><th>Effective control</th><th>State</th><th>Exact request</th><th>Decision</th></tr>{rows}</table></section><section><h2>Credential bindings</h2><table>{cred_rows}</table></section><section><h2>Action catalogue</h2><table><tr><th>Action</th><th>Risk</th><th>Effect</th><th>Summary</th></tr>{action_rows}</table></section><section><h2>Audit</h2><table><tr><th>#</th><th>Event</th><th>Actor</th><th>Request</th><th>Time</th></tr>{audit_rows}</table></section></main><script>document.addEventListener('click',async e=>{{let path,body={{}};if(e.target.dataset.op){{path='/admin/requests/'+e.target.dataset.id+'/'+e.target.dataset.op;body=JSON.parse(e.target.dataset.challenge)}}else if(e.target.dataset.control){{path='/admin/controls';body={{key:e.target.dataset.control,value:e.target.dataset.value==='true'}}}}else if(e.target.dataset.list){{path='/admin/controls';let raw=prompt('Comma-separated values (empty clears):','');if(raw===null)return;body={{key:e.target.dataset.list,value:raw.split(',').map(x=>x.trim()).filter(Boolean)}}}}else return;let r=await fetch(path,{{method:'POST',headers:{{'Origin':location.origin,'X-CSRF-Token':document.querySelector('meta[name=csrf]').content,'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(r.ok)location.reload();else alert(await r.text())}})</script>"""
         return Response(200,{"Content-Type":"text/html;charset=UTF-8","Cache-Control":"no-store"},page.encode())
 
     @staticmethod
@@ -203,8 +220,9 @@ class SemanticGateApplication:
                 p=self._require_mutation(headers); parts=route.strip("/").split("/")
                 if len(parts)!=4: return _json(404,{"error":"not found"})
                 request_id,op=parts[2],parts[3]
-                if op=="approve": value=self.control.approve(request_id,actor=p.principal_id,actor_role=p.role)
-                elif op=="deny": value=self.control.deny(request_id,actor=p.principal_id,actor_role=p.role)
+                challenge=self._decode(body)
+                if op=="approve": value=self.control.approve(request_id,actor=p.principal_id,actor_role=p.role,challenge=challenge)
+                elif op=="deny": value=self.control.deny(request_id,actor=p.principal_id,actor_role=p.role,challenge=challenge)
                 else: return _json(404,{"error":"not found"})
                 return _json(200,value)
             if route=="/admin/controls" and method=="POST":
@@ -214,6 +232,7 @@ class SemanticGateApplication:
                 if value["key"] in {"paused_domains","revoked_principals"} and (not isinstance(value["value"],list) or any(not isinstance(item,str) or not item for item in value["value"])): raise GateControlError("control list is invalid")
                 return _json(200,self.control.set_control(value["key"],value["value"],actor=p.principal_id))
             return _json(404,{"error":"not found"})
+        except GateDecisionConflict as error: return _json(409,{"error":str(error)})
         except PermissionError as error: return _json(403,{"error":str(error)})
         except AuthError as error: return _json(401 if route.startswith(("/api/","/mcp")) else 403,{"error":str(error)})
         except (GateControlError,KeyError,ValueError) as error: return _json(400,{"error":str(error)})

@@ -27,18 +27,33 @@ class CoreBackendTests(unittest.TestCase):
         )
         self.assertEqual("waiting_for_approval", request["state"])
         self.assertFalse(request["execution_possible"])
-        approved = backend.approve_request(request["request_id"], actor="control")
+        approval=next(g for g in request["gates"] if g["kind"]=="approval" and g["status"]=="waiting")
+        challenge={"request_id":request["request_id"],"request_hash":request["request_hash"],"approval_gate_id":approval["id"],"expires_at":request["created_at"]+approval["evidence"]["ttl_seconds"]}
+        approved = backend.approve_request(request["request_id"], actor="control", challenge=challenge)
         self.assertEqual("simulated", approved["state"])
         self.assertFalse(approved["execution_possible"])
         self.assertEqual("semantic.action.home.tv.power_off", approved["would_call"]["tool"])
 
-    def test_step_up_requires_step_up_assurance(self):
+    def test_password_backend_cannot_claim_step_up_assurance(self):
         backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:100)
         request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="step",minimum_control="step_up")
-        with self.assertRaisesRegex(ApprovalRejected,"assurance"):
-            backend.approve_request(request["request_id"],actor="control",assurance="ask")
-        approved=backend.approve_request(request["request_id"],actor="signed-human",assurance="step_up")
-        self.assertEqual("simulated",approved["state"])
+        approval=next(g for g in request["gates"] if g["kind"]=="approval" and g["status"]=="waiting")
+        challenge={"request_id":request["request_id"],"request_hash":request["request_hash"],"approval_gate_id":approval["id"],"expires_at":request["created_at"]+approval["evidence"]["ttl_seconds"]}
+        with self.assertRaisesRegex(ApprovalRejected,"step-up"):
+            backend.approve_request(request["request_id"],actor="control",challenge=challenge)
+
+    def test_backend_rejects_mismatched_expired_and_replayed_decisions(self):
+        now=[100]
+        backend=CoreBackend(build_policy(self.catalog,self.principals),approval_key=bytes.fromhex("22"*32),clock=lambda:now[0])
+        request=backend.request_action(action="home.tv.power_off",parameters={"summary":"Turn TV off","target":"living-room-tv","details":{}},context={},trusted_context={},requester="agent",idempotency_key="deny")
+        approval=next(g for g in request["gates"] if g["kind"]=="approval" and g["status"]=="waiting")
+        exact={"request_id":request["request_id"],"request_hash":request["request_hash"],"approval_gate_id":approval["id"],"expires_at":request["created_at"]+approval["evidence"]["ttl_seconds"]}
+        with self.assertRaises(ApprovalRejected): backend.deny_request(request["request_id"],actor="control",challenge={**exact,"request_hash":"bad"})
+        now[0]=exact["expires_at"]
+        with self.assertRaisesRegex(ApprovalRejected,"expired"): backend.deny_request(request["request_id"],actor="control",challenge=exact)
+        now[0]=100
+        self.assertEqual("denied",backend.deny_request(request["request_id"],actor="control",challenge=exact)["state"])
+        with self.assertRaisesRegex(ApprovalRejected,"awaiting"): backend.deny_request(request["request_id"],actor="control",challenge=exact)
 
     def test_read_and_prohibited_catalog_entries_are_not_requestable(self):
         backend = CoreBackend(build_policy(self.catalog, self.principals), approval_key=bytes.fromhex("22" * 32), clock=lambda: 100)

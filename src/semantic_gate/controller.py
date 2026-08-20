@@ -12,6 +12,10 @@ class GateControlError(ValueError):
     pass
 
 
+class GateDecisionConflict(GateControlError):
+    pass
+
+
 class GateControl:
     REQUEST_REQUIRED_FIELDS = {"action", "parameters", "context", "idempotency_key"}
     REQUEST_OPTIONAL_FIELDS = {"minimum_control"}
@@ -22,6 +26,25 @@ class GateControl:
         self.backend = backend
         self.ledger = ledger
         self.clock = clock
+
+    @staticmethod
+    def _attach_approval_challenge(request: dict) -> dict:
+        if request.get("state") != "waiting_for_approval" or "approval_challenge" in request:
+            return request
+        approval = next((gate for gate in request.get("gates", []) if gate.get("kind") == "approval" and gate.get("status") == "waiting"), None)
+        if approval is None:
+            return request
+        evidence = approval.get("evidence") or {}
+        ttl = evidence.get("ttl_seconds")
+        if type(ttl) is not int or ttl < 1:
+            return request
+        request["approval_challenge"] = {
+            "request_id": request["request_id"],
+            "request_hash": request["request_hash"],
+            "approval_gate_id": approval["id"],
+            "expires_at": int(request["created_at"]) + ttl,
+        }
+        return request
 
     def _allowed(self, principal: str, action: str):
         controls = self.ledger.controls()
@@ -74,6 +97,7 @@ class GateControl:
         )
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
+        self._attach_approval_challenge(request)
         self.ledger.record_request(request, event="requested", actor=principal)
         return request
 
@@ -124,28 +148,42 @@ class GateControl:
         self.ledger.record_request(request, event="cancelled", actor=principal)
         return request
 
-    def approve(self, request_id: str, *, actor: str, actor_role: str, assurance: str = "ask"):
+    def _decision_request(self, request_id: str, challenge: Mapping[str, Any]) -> dict:
+        prior = self.ledger.get_request(request_id)
+        if prior is None:
+            raise GateDecisionConflict("request not found")
+        if prior.get("state") != "waiting_for_approval":
+            raise GateDecisionConflict("request is not awaiting a decision")
+        exact = prior.get("approval_challenge")
+        if not isinstance(challenge, Mapping) or set(challenge) != {"request_id", "request_hash", "approval_gate_id", "expires_at"}:
+            raise GateDecisionConflict("decision challenge is incomplete")
+        if not isinstance(exact, Mapping) or dict(challenge) != dict(exact) or challenge.get("request_id") != request_id:
+            raise GateDecisionConflict("decision challenge does not match the waiting request")
+        if type(challenge.get("expires_at")) is not int or challenge["expires_at"] <= int(self.clock()):
+            raise GateDecisionConflict("decision challenge is expired")
+        return prior
+
+    def approve(self, request_id: str, *, actor: str, actor_role: str, challenge: Mapping[str, Any]):
         if actor_role != "admin":
             raise GateControlError("admin approval transport is required")
-        if assurance not in {"ask","step_up"}:
-            raise GateControlError("approval assurance is invalid")
-        request = self.backend.approve_request(request_id, actor=actor, assurance=assurance)
+        self._decision_request(request_id, challenge)
+        try:
+            request = self.backend.approve_request(request_id, actor=actor, challenge=dict(challenge))
+        except Exception as error:
+            raise GateDecisionConflict(str(error)) from error
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
         self.ledger.record_request(request, event="approved", actor=actor)
         return request
 
-    def deny(self, request_id: str, *, actor: str, actor_role: str):
+    def deny(self, request_id: str, *, actor: str, actor_role: str, challenge: Mapping[str, Any]):
         if actor_role != "admin":
             raise GateControlError("admin denial transport is required")
-        prior = self.ledger.get_request(request_id)
-        if prior is None:
-            raise GateControlError("request not found")
+        self._decision_request(request_id, challenge)
         try:
-            request = self.backend.cancel_request(request_id, requester=prior["requester"])
-        except Exception:
-            request = dict(prior)
-        request["state"] = "denied"
+            request = self.backend.deny_request(request_id, actor=actor, challenge=dict(challenge))
+        except Exception as error:
+            raise GateDecisionConflict(str(error)) from error
         request["updated_at"] = int(self.clock())
         self.ledger.record_request(request, event="denied", actor=actor)
         return request

@@ -60,12 +60,21 @@ through the gateway directly.
 - **Out-of-band approval:** approval ingestion is a host API, never an agent-callable MCP tool.
 - **Exact binding:** approval evidence is bound to request ID, request hash,
   approval-gate ID, unique evidence ID and expiry.
+- **Exact human decisions:** the authenticated panel posts the immutable request
+  ID/hash, approval-gate ID and fixed deadline. Missing, stale, mismatched,
+  expired, terminal and replayed decisions fail with HTTP 409; terminal history
+  is never rewritten. The password panel cannot claim step-up assurance.
 - **TOCTOU protection:** enforcing workflows require a post-approval recheck
   after every approval before execution.
 - **Idempotency:** keys are bound to exact canonical requests.
 - **In-process serialization:** concurrent approval callbacks cannot execute one request twice.
 - **Notification binding:** delivery evidence is bound to request ID/hash, gate,
   recipient, template hash, delivery time and a unique notification ID.
+- **Durable notification outbox foundation:** SQLite schema v1 stores stable,
+  deduplicated notification identities bound to that same exact tuple, with
+  pending/delivered/unknown states, attempt/backoff data and token-safe
+  claim/complete/release operations that survive restart. A host notifier must
+  still perform delivery and provide truthful delivery evidence.
 - **Separated tool roles:** read gates and effectful targets live in different registries.
 - **Dual execution control:** live execution needs policy enablement **and** a host-owned `ExecutionAuthority` object.
 - **Safe MCP defaults:** the CLI MCP server has no trusted approval verifier or execution authority.
@@ -135,7 +144,8 @@ See [`examples/`](examples/) for calendar, purchase and device-control flows.
 - authenticated, idempotent audit-only permission observations;
 - proposal-only MCP over HTTP;
 - a mobile control panel for simulation review;
-- SQLite request snapshots, audit events and emergency controls;
+- SQLite request snapshots, audit events, emergency controls and a durable
+  notification-outbox foundation;
 - host-derived principal capabilities;
 - redacted credential-binding inventory.
 

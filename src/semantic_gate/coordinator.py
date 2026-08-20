@@ -74,15 +74,30 @@ class CoreBackend:
     def cancel_request(self, request_id: str, requester: str):
         return self.engine.cancel_request(request_id, requester=requester)
 
-    def approve_request(self, request_id: str, actor: str, assurance: str = "ask"):
-        if assurance not in {"ask","step_up"}:
-            raise ApprovalRejected("approval assurance is invalid")
+    def _decision(self, request_id: str, challenge: dict) -> tuple[dict, dict]:
         request = self.engine.get_request(request_id)
-        approval = next(
-            gate for gate in request["gates"]
-            if gate["kind"] == "approval" and gate["status"] == "waiting"
-        )
+        if request["state"] != "waiting_for_approval":
+            raise ApprovalRejected("request is not awaiting approval")
+        if not isinstance(challenge, dict) or set(challenge) != {"request_id", "request_hash", "approval_gate_id", "expires_at"}:
+            raise ApprovalRejected("decision challenge is incomplete")
+        approval = next(gate for gate in request["gates"] if gate["kind"] == "approval" and gate["status"] == "waiting")
         ttl = int(approval["evidence"]["ttl_seconds"])
+        expected = {
+            "request_id": request_id,
+            "request_hash": request["request_hash"],
+            "approval_gate_id": approval["id"],
+            "expires_at": int(request["created_at"]) + ttl,
+        }
+        if challenge != expected:
+            raise ApprovalRejected("decision challenge does not match the waiting request")
+        if challenge["expires_at"] <= int(self.clock()):
+            raise ApprovalRejected("decision challenge is expired")
+        return request, approval
+
+    def approve_request(self, request_id: str, actor: str, challenge: dict):
+        request, approval = self._decision(request_id, challenge)
+        if request.get("effective_control") == "step_up":
+            raise ApprovalRejected("step-up requires an independent stronger transport")
         evidence = {
             "evidence_id": "approval_" + secrets.token_hex(16),
             "request_id": request_id,
@@ -90,8 +105,20 @@ class CoreBackend:
             "approval_gate_id": approval["id"],
             "actor": actor,
             "decision": "approve",
-            "assurance": assurance,
-            "expires_at": int(self.clock()) + ttl,
+            "assurance": "ask",
+            "expires_at": challenge["expires_at"],
         }
         evidence["signature"] = self.verifier.sign(evidence)
         return self.engine.ingest_trusted_approval(request_id, evidence)
+
+    def deny_request(self, request_id: str, actor: str, challenge: dict):
+        request, approval = self._decision(request_id, challenge)
+        return self.engine.ingest_trusted_denial(request_id, {
+            "request_id": request_id,
+            "request_hash": request["request_hash"],
+            "approval_gate_id": approval["id"],
+            "actor": actor,
+            "decision": "deny",
+            "expires_at": challenge["expires_at"],
+            "decided_at": int(self.clock()),
+        })

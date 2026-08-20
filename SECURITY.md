@@ -30,6 +30,14 @@ access to the downstream effectful tools that Semantic Gate is meant to gate.
     request control. The bundled password panel provides ordinary assurance;
     deployments must use an independently authenticated stronger transport for
     step-up.
+18. Panel decisions are host-only, CSRF-protected exact challenges bound to the
+    request ID/hash, approval gate and fixed expiry. Conflict responses cover
+    missing, mismatched, expired, non-waiting and replayed decisions; failed
+    decisions cannot overwrite a terminal snapshot or append a decision audit.
+19. Durable outbox records are bound to request ID/hash, notification gate,
+    recipient and template hash. Claim tokens prevent stale workers from
+    completing or releasing another attempt. `unknown` delivery is terminal for
+    automatic claims because retrying an ambiguous send could duplicate it.
 
 ## Host responsibilities
 
@@ -40,6 +48,8 @@ A production host must:
 - keep target credentials outside agent environments;
 - ensure agents cannot bypass the gateway by accessing raw target tools;
 - implement a notifier that provides truthful delivery evidence;
+- drive the durable outbox with a provider-specific worker, mark ambiguous
+  provider outcomes `unknown`, and reconcile them before any manual retry;
 - verify human approval through an independent authenticated surface;
 - bind approval to request hash, actor, decision and expiry;
 - persist request/evidence state transactionally if restart safety matters;
@@ -69,7 +79,7 @@ validation to HTTP and MCP bodies and emits no CORS policy.
 - crash-resumable transactional engine state for live execution;
 - distributed consensus or locks across coordinator replicas;
 - built-in identity provider or biometric verification;
-- built-in notification provider;
+- built-in notification provider (the SQLite outbox is transport-neutral only);
 - built-in downstream MCP client;
 - secret storage;
 - process/container isolation;

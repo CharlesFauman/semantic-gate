@@ -2,7 +2,9 @@
 """Durable request snapshots, controls and append-only audit metadata."""
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 import sqlite3
 import threading
 from pathlib import Path
@@ -56,6 +58,25 @@ class Ledger:
           updated_at INTEGER NOT NULL,
           actor TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS notification_outbox (
+          notification_id TEXT PRIMARY KEY,
+          request_id TEXT NOT NULL,
+          request_hash TEXT NOT NULL,
+          notify_gate_id TEXT NOT NULL,
+          recipient TEXT NOT NULL,
+          template_hash TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('pending','delivered','unknown')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at INTEGER NOT NULL,
+          claimed_at INTEGER,
+          claim_expires_at INTEGER,
+          claim_token TEXT,
+          created_at INTEGER NOT NULL,
+          delivered_at INTEGER,
+          last_error TEXT,
+          UNIQUE(request_id,request_hash,notify_gate_id,recipient,template_hash)
+        );
+        PRAGMA user_version=1;
         """)
         self._db.commit()
 
@@ -68,6 +89,93 @@ class Ledger:
             if self._db is not None:
                 self._db.close()
                 self._db = None
+
+    def schema_version(self) -> int:
+        with self._lock:
+            return int(self._db.execute("PRAGMA user_version").fetchone()[0])
+
+    @staticmethod
+    def _notification(row: sqlite3.Row | None) -> dict | None:
+        return dict(row) if row is not None else None
+
+    def get_notification(self, notification_id: str) -> dict | None:
+        with self._lock:
+            row=self._db.execute("SELECT * FROM notification_outbox WHERE notification_id=?",(notification_id,)).fetchone()
+        return self._notification(row)
+
+    def enqueue_notification(self, *, request_id: str, request_hash: str, notify_gate_id: str, recipient: str, template_hash: str, now: int) -> dict:
+        binding=(request_id,request_hash,notify_gate_id,recipient,template_hash)
+        if any(not isinstance(value,str) or not value for value in binding):
+            raise ValueError("notification binding fields must be non-empty strings")
+        digest=hashlib.sha256(self._json(binding).encode()).hexdigest()
+        notification_id="notice_"+digest
+        with self._lock,self._db:
+            self._db.execute(
+                """INSERT OR IGNORE INTO notification_outbox(
+                   notification_id,request_id,request_hash,notify_gate_id,recipient,template_hash,state,attempts,next_attempt_at,created_at
+                   ) VALUES(?,?,?,?,?,?,'pending',0,?,?)""",
+                (notification_id,*binding,int(now),int(now)),
+            )
+            row=self._db.execute("SELECT * FROM notification_outbox WHERE notification_id=?",(notification_id,)).fetchone()
+        return dict(row)
+
+    def claim_notification(self, *, now: int, lease_seconds: int) -> dict | None:
+        if type(lease_seconds) is not int or lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        now=int(now); token=secrets.token_hex(16)
+        with self._lock,self._db:
+            row=self._db.execute(
+                """SELECT notification_id FROM notification_outbox
+                   WHERE state='pending' AND next_attempt_at<=?
+                     AND (claim_token IS NULL OR claim_expires_at<=?)
+                   ORDER BY next_attempt_at,created_at,notification_id LIMIT 1""",
+                (now,now),
+            ).fetchone()
+            if row is None:
+                return None
+            changed=self._db.execute(
+                """UPDATE notification_outbox SET claim_token=?,claimed_at=?,claim_expires_at=?,attempts=attempts+1
+                   WHERE notification_id=? AND state='pending'
+                     AND (claim_token IS NULL OR claim_expires_at<=?)""",
+                (token,now,now+lease_seconds,row["notification_id"],now),
+            )
+            if changed.rowcount != 1:
+                return None
+            claimed=self._db.execute("SELECT * FROM notification_outbox WHERE notification_id=?",(row["notification_id"],)).fetchone()
+        return dict(claimed)
+
+    def _claimed_notification(self, notification_id: str, claim_token: str, *, at: int) -> sqlite3.Row:
+        row=self._db.execute("SELECT * FROM notification_outbox WHERE notification_id=?",(notification_id,)).fetchone()
+        if row is None or row["state"] != "pending" or not isinstance(claim_token,str) or row["claim_token"] != claim_token or row["claim_expires_at"] < int(at):
+            raise ValueError("notification claim is missing, stale, or already completed")
+        return row
+
+    def complete_notification(self, notification_id: str, *, claim_token: str, delivered_at: int) -> dict:
+        with self._lock,self._db:
+            self._claimed_notification(notification_id,claim_token,at=delivered_at)
+            self._db.execute(
+                """UPDATE notification_outbox SET state='delivered',delivered_at=?,claim_token=NULL,
+                   claimed_at=NULL,claim_expires_at=NULL,last_error=NULL WHERE notification_id=?""",
+                (int(delivered_at),notification_id),
+            )
+            row=self._db.execute("SELECT * FROM notification_outbox WHERE notification_id=?",(notification_id,)).fetchone()
+        return dict(row)
+
+    def release_notification(self, notification_id: str, *, claim_token: str, now: int, backoff_seconds: int, last_error: str | None = None, delivery_unknown: bool = False) -> dict:
+        if type(backoff_seconds) is not int or backoff_seconds < 0:
+            raise ValueError("backoff_seconds must be non-negative")
+        if last_error is not None and (not isinstance(last_error,str) or len(last_error)>500):
+            raise ValueError("last_error must be a bounded string")
+        with self._lock,self._db:
+            self._claimed_notification(notification_id,claim_token,at=now)
+            state="unknown" if delivery_unknown else "pending"
+            self._db.execute(
+                """UPDATE notification_outbox SET state=?,next_attempt_at=?,claim_token=NULL,
+                   claimed_at=NULL,claim_expires_at=NULL,last_error=? WHERE notification_id=?""",
+                (state,int(now)+backoff_seconds,last_error,notification_id),
+            )
+            row=self._db.execute("SELECT * FROM notification_outbox WHERE notification_id=?",(notification_id,)).fetchone()
+        return dict(row)
 
     def record_request(self, request: dict, *, event: str, actor: str, metadata: dict | None = None):
         request_id = request["request_id"]

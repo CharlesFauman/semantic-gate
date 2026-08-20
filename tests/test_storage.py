@@ -108,6 +108,60 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(1,len([event for event in self.ledger.audit_events() if event["event"]=="permission_observed"]))
         finally: other.close()
 
+    def test_notification_outbox_is_exactly_bound_deduplicated_and_restart_durable(self):
+        binding={"request_id":"req_notice","request_hash":"a"*64,"notify_gate_id":"notify_owner","recipient":"human_owner","template_hash":"b"*64}
+        first=self.ledger.enqueue_notification(**binding,now=100)
+        duplicate=self.ledger.enqueue_notification(**binding,now=101)
+        self.assertEqual(first,duplicate)
+        self.assertEqual("pending",first["state"])
+        self.assertEqual(0,first["attempts"])
+        self.assertTrue(first["notification_id"].startswith("notice_"))
+        self.ledger.close()
+        reopened=Ledger(self.path)
+        try:
+            self.assertEqual(first,reopened.get_notification(first["notification_id"]))
+            self.assertGreaterEqual(reopened.schema_version(),1)
+        finally: reopened.close()
+
+    def test_notification_claim_complete_release_and_unknown_are_token_safe(self):
+        binding={"request_id":"req_claim","request_hash":"c"*64,"notify_gate_id":"notify","recipient":"owner","template_hash":"d"*64}
+        notice=self.ledger.enqueue_notification(**binding,now=10)
+        claim=self.ledger.claim_notification(now=10,lease_seconds=5)
+        self.assertEqual(notice["notification_id"],claim["notification_id"])
+        self.assertEqual(1,claim["attempts"])
+        self.assertIsNone(self.ledger.claim_notification(now=11,lease_seconds=5))
+        with self.assertRaisesRegex(ValueError,"claim"):
+            self.ledger.release_notification(notice["notification_id"],claim_token="wrong",now=11,backoff_seconds=7)
+        released=self.ledger.release_notification(notice["notification_id"],claim_token=claim["claim_token"],now=11,backoff_seconds=7,last_error="temporary")
+        self.assertEqual(18,released["next_attempt_at"])
+        self.assertIsNone(self.ledger.claim_notification(now=17,lease_seconds=5))
+        second=self.ledger.claim_notification(now=18,lease_seconds=5)
+        delivered=self.ledger.complete_notification(notice["notification_id"],claim_token=second["claim_token"],delivered_at=19)
+        self.assertEqual("delivered",delivered["state"])
+        self.assertIsNone(self.ledger.claim_notification(now=30,lease_seconds=5))
+        other=self.ledger.enqueue_notification(**{**binding,"request_id":"req_unknown"},now=20)
+        unknown_claim=self.ledger.claim_notification(now=20,lease_seconds=5)
+        unknown=self.ledger.release_notification(other["notification_id"],claim_token=unknown_claim["claim_token"],now=21,backoff_seconds=0,delivery_unknown=True)
+        self.assertEqual("unknown",unknown["state"])
+        self.assertIsNone(self.ledger.claim_notification(now=100,lease_seconds=5))
+        stale=self.ledger.enqueue_notification(**{**binding,"request_id":"req_stale"},now=200)
+        stale_claim=self.ledger.claim_notification(now=200,lease_seconds=5)
+        with self.assertRaisesRegex(ValueError,"stale"):
+            self.ledger.complete_notification(stale["notification_id"],claim_token=stale_claim["claim_token"],delivered_at=206)
+
+    def test_concurrent_outbox_claim_has_one_winner(self):
+        self.ledger.enqueue_notification(request_id="req_race",request_hash="e"*64,notify_gate_id="notify",recipient="owner",template_hash="f"*64,now=1)
+        other=Ledger(self.path); barrier=__import__("threading").Barrier(2); results=[]; errors=[]
+        def claim(ledger):
+            try: barrier.wait(); results.append(ledger.claim_notification(now=1,lease_seconds=10))
+            except Exception as error: errors.append(error)
+        threads=[__import__("threading").Thread(target=claim,args=(ledger,)) for ledger in (self.ledger,other)]
+        try:
+            [thread.start() for thread in threads]; [thread.join() for thread in threads]
+            self.assertEqual([],errors)
+            self.assertEqual(1,len([result for result in results if result is not None]))
+        finally: other.close()
+
 
 if __name__ == "__main__":
     unittest.main()

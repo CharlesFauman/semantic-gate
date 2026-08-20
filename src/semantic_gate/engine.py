@@ -598,7 +598,7 @@ def _synchronized(method):
 class GatewayEngine:
     """Deterministic state machine for semantic action workflows."""
 
-    TERMINAL = {"blocked", "cancelled", "simulated", "executed", "failed"}
+    TERMINAL = {"blocked", "cancelled", "simulated", "executed", "failed", "denied"}
     SATISFIED = {"passed", "simulated", "approved"}
 
     def __init__(
@@ -864,6 +864,25 @@ class GatewayEngine:
         }
         request["state"] = "processing"
         self._advance(request, workflow)
+        self._release_terminal_workflow(request)
+        return self.get_request(request_id)
+
+    @_synchronized
+    def ingest_trusted_denial(self, request_id: str, evidence: Mapping[str, Any]) -> dict:
+        """Host-only denial transport; deliberately absent from MCP."""
+        request = self._requests.get(request_id)
+        if request is None or request["state"] != "waiting_for_approval":
+            raise ApprovalRejected("request is not awaiting approval")
+        approval = next(gate for gate in request["gates"] if gate["kind"] == "approval" and gate["status"] == "waiting")
+        if evidence.get("decision") != "deny" or evidence.get("request_id") != request_id:
+            raise ApprovalRejected("denial is bound to a different request")
+        if evidence.get("request_hash") != request["request_hash"] or evidence.get("approval_gate_id") != approval["id"]:
+            raise ApprovalRejected("denial is bound to different request evidence")
+        if not isinstance(evidence.get("actor"), str) or not evidence["actor"]:
+            raise ApprovalRejected("denial actor is missing")
+        approval["status"] = "denied"
+        approval["evidence"] = _copy(evidence)
+        request["state"] = "denied"
         self._release_terminal_workflow(request)
         return self.get_request(request_id)
 

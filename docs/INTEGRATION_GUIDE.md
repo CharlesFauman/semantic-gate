@@ -93,6 +93,23 @@ action enforced merely because another uses a broker.
 - Browser/desktop: prefer isolated sessions and fixed reviewed flows; preserve OS/browser permission boundaries.
 - Mobile: retain on-device permission and secure-enclave boundaries; host approval cannot impersonate the device.
 
+## Approval panel and notification workers
+
+The bundled authenticated panel can approve or deny only a currently waiting,
+ordinary-assurance request. It submits the exact immutable challenge shown with
+the review: request ID, full request hash, approval-gate ID and fixed expiry.
+HTTP 409 means the reviewer must refresh and, if expired, request a new proposal;
+a terminal decision must never be retried. Step-up approval requires a separate,
+independently authenticated stronger transport.
+
+`Ledger` exposes a transport-neutral SQLite outbox. Enqueue the exact request
+ID/hash, notify-gate ID, recipient and template hash; then use
+`claim_notification`, `complete_notification` and `release_notification` from a
+provider worker. Release known failures with bounded backoff. Release ambiguous
+provider outcomes with `delivery_unknown=True` and reconcile them rather than
+retrying automatically. Outbox state alone is not notification delivery evidence
+and does not relax the engine's existing exact evidence checks.
+
 ## Private deployment boundary
 
 Keep generic workflow, engine, SDK, MCP, broker and plugin abstractions in this repository. Private consumers should keep real identities, hosts, IPs, credentials, action catalogues, node assignments, service wiring and migration state in their own repository. Private integrations can publish generalized examples here after removing deployment assumptions and identifiers.
