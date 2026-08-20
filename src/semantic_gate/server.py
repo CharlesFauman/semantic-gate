@@ -7,14 +7,17 @@ import hmac
 import html
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http import cookies
 from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit
 
+from . import autoapproval
 from .auth import AuthError, CapabilityAuthority, Principal
 from .controller import GateControl, GateControlError, GateDecisionConflict
 from .credentials import CredentialRegistry
 from .engine import GatePolicyError, _validate_json_value
+from .projection import build_decision_card, collapse_observations, partition_audit_events, render_decision_card_html
 
 
 @dataclass
@@ -35,6 +38,78 @@ def _json(status: int, value: Any, headers: dict[str, str] | None = None) -> Res
 def _header(headers: Mapping[str, str], name: str) -> str | None:
     wanted=name.casefold()
     return next((value for key,value in headers.items() if key.casefold()==wanted),None)
+
+
+# Panel palette. Every pair in PANEL_CONTRAST_PAIRS is asserted against WCAG AA in the tests.
+PANEL_COLORS = {
+    "page":"#0b1020","surface":"#161d33","text":"#eef2ff","muted":"#c2cbe8","line":"#3a4570",
+    "accent":"#9ec5ff","urgent":"#ffcf6b","danger":"#ff9d94","focus":"#ffd479",
+    "approve_bg":"#7ee2a8","approve_fg":"#04210f","deny_bg":"#ff9d94","deny_fg":"#2b0703",
+}
+PANEL_CONTRAST_PAIRS = (
+    ("text","page"),("text","surface"),("muted","surface"),("accent","surface"),
+    ("urgent","surface"),("danger","surface"),("focus","surface"),
+    ("approve_fg","approve_bg"),("deny_fg","deny_bg"),
+)
+
+
+_PANEL_CSS = """*{{box-sizing:border-box}}
+body{{font:16px/1.5 system-ui,sans-serif;background:{page};color:{text};margin:0}}
+a{{color:{accent}}}
+.skip{{position:absolute;left:-9999px}}
+.skip:focus{{position:fixed;left:8px;top:8px;z-index:9;background:{surface};color:{text};padding:10px;border:2px solid {focus}}}
+main{{max-width:70rem;margin:0 auto;padding:16px}}
+h1{{font-size:1.5rem;margin:8px 0}}
+h2{{font-size:1.15rem;margin:0 0 12px}}
+h3{{font-size:1.05rem;margin:0 0 4px;font-family:ui-monospace,monospace}}
+section{{background:{surface};border:1px solid {line};border-radius:10px;padding:16px;margin:12px 0}}
+.decision{{border:1px solid {line};border-left:6px solid {accent};border-radius:8px;padding:14px;margin:14px 0}}
+.decision.urgent{{border-left-color:{urgent}}}
+.decision.expired,.decision.unknown{{border-left-color:{danger}}}
+.chip{{font-weight:700;margin:0 0 10px}}
+p.banner{{margin:0 0 10px;padding:10px;border:2px solid {urgent};border-radius:8px;color:{urgent};font-weight:600}}
+nav.feeds{{display:flex;flex-wrap:wrap;gap:14px;margin:0 0 12px}}
+.chip.urgent{{color:{urgent}}}
+.chip.expired,.chip.unknown{{color:{danger}}}
+dl.facts{{display:grid;grid-template-columns:15rem minmax(0,1fr);gap:6px 14px;margin:0 0 12px}}
+dt{{color:{muted};font-weight:600}}
+dd{{margin:0;overflow-wrap:anywhere}}
+p.consequence{{margin:4px 0}}
+.actions{{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}}
+.actions form{{margin:0}}
+button{{font:inherit;font-weight:700;min-height:44px;padding:12px 18px;border:0;border-radius:8px;cursor:pointer;background:{approve_bg};color:{approve_fg}}}
+button.danger{{background:{deny_bg};color:{deny_fg}}}
+button[disabled]{{background:{line};color:{text};cursor:not-allowed}}
+:focus-visible{{outline:3px solid {focus};outline-offset:2px}}
+label{{display:block;color:{muted};margin:10px 0 4px}}
+input[type=text]{{font:inherit;width:min(100%,26rem);padding:10px;border:1px solid {line};border-radius:8px;background:{page};color:{text}}}
+table{{border-collapse:collapse;width:100%}}
+caption{{text-align:left;padding-bottom:8px}}
+th,td{{padding:8px;border-bottom:1px solid {line};text-align:left;vertical-align:top}}
+code{{font-family:ui-monospace,monospace;color:{accent};overflow-wrap:anywhere}}
+pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:{page};border:1px solid {line};border-radius:8px;padding:10px}}
+.muted{{color:{muted}}}
+.warn{{color:{urgent};font-weight:700}}
+summary{{cursor:pointer;font-weight:700;color:{accent};padding:6px 0}}
+details.request-review dl{{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:6px 12px}}
+@media (max-width:640px){{main{{padding:10px}}dl.facts{{grid-template-columns:1fr;gap:0}}dt{{margin-top:10px}}
+.actions{{flex-direction:column}}.actions form,.actions button{{width:100%}}section{{padding:12px}}
+table{{display:block;overflow-x:auto}}}}""".format(**PANEL_COLORS)
+
+
+_LOGIN_CSS = """body{{font:16px/1.5 system-ui,sans-serif;background:{page};color:{text};margin:0}}
+main{{display:grid;place-items:center;min-height:100vh;padding:16px}}
+form{{background:{surface};border:1px solid {line};border-radius:10px;padding:24px;width:min(100%,24rem)}}
+h1{{font-size:1.4rem;margin:0 0 12px}}
+label{{display:block;color:{muted};margin:12px 0 4px}}
+input{{font:inherit;width:100%;padding:12px;border:1px solid {line};border-radius:8px;background:{page};color:{text}}}
+button{{font:inherit;font-weight:700;width:100%;min-height:44px;margin-top:16px;padding:12px;border:0;border-radius:8px;background:{approve_bg};color:{approve_fg};cursor:pointer}}
+:focus-visible{{outline:3px solid {focus};outline-offset:2px}}""".format(**PANEL_COLORS)
+
+
+def _utc(value: Any) -> str:
+    if type(value) is not int: return "unknown"
+    return datetime.fromtimestamp(value,tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _request_review(request: Mapping[str, Any]) -> str:
@@ -68,8 +143,7 @@ def _request_review(request: Mapping[str, Any]) -> str:
         f"<dt>Approval expires at</dt><dd>{html.escape(str(expiry))}</dd></dl>"
         "<p>If this request expires, submit a new proposal; never reuse an old decision.</p>"
     )
-    open_attr=" open" if request.get("state")=="waiting_for_approval" else ""
-    return f"<details class=request-review{open_attr}><summary>Review exact request</summary><dl>{fields}</dl>{message_html}{binding}</details>"
+    return f"<details class=request-review><summary>Review exact request</summary><dl>{fields}</dl>{message_html}{binding}</details>"
 
 
 MCP_TOOLS = [
@@ -82,8 +156,12 @@ MCP_TOOLS = [
 
 
 class SemanticGateApplication:
-    def __init__(self, control: GateControl, authority: CapabilityAuthority, credentials: CredentialRegistry, *, catalog: Mapping[str, Any], admin_password: str, admin_principal_id: str = "control", origins: Sequence[str], clock, secure_cookies: bool = True, status_provider=None):
-        self.control=control; self.authority=authority; self.credentials=credentials
+    FEEDS = ("decisions","denials","gate_errors","withdrawn","telemetry")
+    FEED_LABELS = {"decisions":"Gate decisions","denials":"Policy denials","gate_errors":"Gate errors",
+                   "withdrawn":"Withdrawn or expired","telemetry":"Execution telemetry"}
+
+    def __init__(self, control: GateControl, authority: CapabilityAuthority, credentials: CredentialRegistry, *, catalog: Mapping[str, Any], admin_password: str, admin_principal_id: str = "control", origins: Sequence[str], clock, secure_cookies: bool = True, status_provider=None, auto_approval=None):
+        self.control=control; self.authority=authority; self.credentials=credentials; self.auto_approval=auto_approval
         self.catalog=dict(catalog); self.admin_password=admin_password; self.admin_principal_id=admin_principal_id; self.clock=clock; self.secure_cookies=secure_cookies
         self.status_provider=status_provider or (lambda:{})
         self.origins=frozenset(origin.rstrip("/") for origin in origins)
@@ -142,63 +220,205 @@ class SemanticGateApplication:
             raise GateControlError("duplicate form field")
         return {key:items[0] for key,items in values.items()}
 
-    def _panel(self, session: str) -> Response:
+    def _hidden(self, fields: Mapping[str,Any]) -> str:
+        return "".join(f"<input type=hidden name='{html.escape(str(key),quote=True)}' value='{html.escape(str(value),quote=True)}'>" for key,value in fields.items())
+
+    def _decision_controls(self, item: Mapping[str,Any], *, csrf: str, card: Mapping[str,Any]) -> str:
+        if not card["decision_available"]:
+            if card["urgency"]=="expired":
+                return "<p class=warn><b>Approval expired.</b> Submit a new proposal; this request cannot be revived.</p>"
+            return "<p class=warn>Decision unavailable; refresh or submit a new proposal.</p>"
+        request_id=html.escape(str(item.get("request_id","")),quote=True)
+        hidden=self._hidden({"csrf_token":csrf,**dict(card["reaction_binding"])})
+        deny=f"<form method=post action='/admin/requests/{request_id}/deny'>{hidden}<button class=danger type=submit>Deny</button></form>"
+        if item.get("effective_control")=="step_up":
+            return f"<div class=actions><button disabled>Step-up required</button>{deny}</div><p class=muted>Step-up assurance needs an independently authenticated stronger transport.</p>"
+        approve=f"<form method=post action='/admin/requests/{request_id}/approve'>{hidden}<button type=submit>Approve once</button></form>"
+        return f"<div class=actions>{approve}{deny}</div>"
+
+    def _decision_card(self, item: Mapping[str,Any], *, csrf: str, now: int) -> str:
+        """Render one pending decision from the bounded, allowlisted projection only."""
+        card=build_decision_card(
+            item,catalog=self.catalog,now=now,
+            delivery=self.control.ledger.notifications_for_request(str(item.get("request_id",""))),
+        )
+        dry_run=item.get("auto_approval")
+        explanation=""
+        if isinstance(dry_run,Mapping) and dry_run.get("matched") is False:
+            explanation=(f"<p class=muted><b>Auto-approval did not apply</b> - {html.escape(str(dry_run.get('reason','')))}</p>")
+        return (f"<article class='decision {html.escape(card['urgency'])}'>{render_decision_card_html(card)}{explanation}"
+                f"{self._decision_controls(item,csrf=csrf,card=card)}{_request_review(item)}</article>")
+
+    def _rule_state(self, rule: Mapping[str,Any], *, now: int, controls: Mapping[str,Any]) -> str:
+        if str(rule["rule_id"]) in (controls.get("disabled_auto_rules") or []): return "Disabled"
+        if int(rule["expires_at"])<=now: return "Expired"
+        if int(rule["review_by"])<=now: return "Review overdue"
+        return "Enabled"
+
+    def _rule_scope(self, rule: Mapping[str,Any]) -> str:
+        if rule["action_class"]=="global_simulation":
+            return "Standing: every catalogued action above the prohibited safety floor, simulation only"
+        parts=[f"class {rule['action_class']}",", ".join(rule["actions"]),f"repo {rule['repository']}",", ".join(rule["refs"])]
+        if rule["environments"]: parts.append("environments "+", ".join(rule["environments"]))
+        if rule["targets"]: parts.append("targets "+", ".join(rule["targets"]))
+        parts.append("requesters "+", ".join(rule["requesters"]))
+        parts.append("nodes "+", ".join(rule["nodes"]))
+        return " | ".join(parts)
+
+    def _auto_approval_section(self, csrf: str, *, now: int, controls: Mapping[str,Any]) -> str:
+        if self.auto_approval is None:
+            return ("<section aria-labelledby=rules-heading><h2 id=rules-heading>Auto-approval rules</h2>"
+                    "<p class=muted>No auto-approval policy is configured; every gated request asks a human.</p></section>")
+        paused=controls.get("auto_approval_paused") is True
+        disabled=list(controls.get("disabled_auto_rules") or [])
+        rules=[rule for rule in (self.auto_approval.global_simulation_rule,) if rule is not None]+list(self.auto_approval.rules)
+        rows=""
+        for rule in rules:
+            rule_id=str(rule["rule_id"]); state=self._rule_state(rule,now=now,controls=controls)
+            remaining=[item for item in disabled if item!=rule_id]
+            toggle_value=", ".join(remaining if state=="Disabled" else sorted(set(disabled)|{rule_id}))
+            toggle_label="Enable" if state=="Disabled" else "Disable"
+            toggle=(f"<form method=post action='/admin/controls'>"
+                    f"{self._hidden({'csrf_token':csrf,'key':'disabled_auto_rules','value':toggle_value})}"
+                    f"<button{'' if state=='Disabled' else ' class=danger'} type=submit>{toggle_label}</button></form>")
+            rows+=(f"<tr><td><code>{html.escape(rule_id)}</code></td><td>version {int(rule['version'])}</td>"
+                   f"<td>{html.escape(self._rule_scope(rule))}</td><td><b>{html.escape(state)}</b></td>"
+                   f"<td>Next review {html.escape(_utc(rule['review_by']))}<br>Expires {html.escape(_utc(rule['expires_at']))}</td>"
+                   f"<td>{toggle}</td></tr>")
+        floor=", ".join(sorted(autoapproval.PROHIBITED_CLASSES))
+        pause=(f"<form method=post action='/admin/controls'>{self._hidden({'csrf_token':csrf,'key':'auto_approval_paused','value':'false' if paused else 'true'})}"
+               f"<button{'' if paused else ' class=danger'} type=submit>{'Resume auto-approval' if paused else 'Pause auto-approval'}</button></form>")
+        banner=("<p class=banner><b>GLOBAL AUTO-APPROVE</b> - simulation only. Policy approves the approval gate for "
+                "catalogued safe work; <b>execution_enabled=false</b> is a separate hard stop, so nothing is executed.</p>"
+                if self.auto_approval.global_simulation_rule is not None else
+                "<p class=banner><b>Scoped auto-approval only</b> - simulation only; execution_enabled=false remains a separate hard stop.</p>")
+        state_line="<p class=warn>Auto-approval is paused by a human; every request asks a human.</p>" if paused else "<p class=muted>Auto-approval is active for the declared scope below.</p>"
+        return ("<section aria-labelledby=rules-heading><h2 id=rules-heading>Auto-approval rules</h2>"
+                f"{banner}{state_line}<div class=actions>{pause}</div>"
+                "<table><thead><tr><th scope=col>Rule</th><th scope=col>Version</th><th scope=col>Declared scope</th>"
+                "<th scope=col>State</th><th scope=col>Review</th><th scope=col>Human control</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table>"
+                f"<p><b>Always asks a human:</b> {html.escape(floor)}</p>"
+                "<p class=muted>Rules are checked-in and host-owned. No agent-callable surface can create, edit, "
+                "enable, disable or pause them.</p></section>")
+
+    def _feed_section(self, feed: str, *, audit_events, observations) -> str:
+        lanes=partition_audit_events(audit_events)
+        telemetry=collapse_observations(observations)
+        counts={**{lane:len(rows) for lane,rows in lanes.items()},"telemetry":len(telemetry)}
+        nav="".join(
+            (f"<b class=chip>{html.escape(self.FEED_LABELS[name])} ({counts.get(name,0)})</b>" if name==feed
+             else f"<a href='/?feed={name}'>{html.escape(self.FEED_LABELS[name])} ({counts.get(name,0)})</a>")
+            for name in self.FEEDS)
+        if feed=="telemetry":
+            head="<tr><th scope=col>Outcome</th><th scope=col>Source</th><th scope=col>Operation</th><th scope=col>Events</th><th scope=col>Seen</th></tr>"
+            body="".join(
+                f"<tr><td>{html.escape(row['label'])}</td><td>{html.escape(row['source'])}</td>"
+                f"<td><code>{html.escape(row['operation'])}</code></td>"
+                f"<td><code>{html.escape(', '.join(row['event_ids']))}</code> · occurrences {int(row['occurrences'])}</td>"
+                f"<td>{html.escape(_utc(row['last_seen_at']))}</td></tr>" for row in reversed(telemetry)) \
+                or "<tr><td colspan=5>No execution telemetry.</td></tr>"
+        else:
+            head="<tr><th scope=col>#</th><th scope=col>What happened</th><th scope=col>Source</th><th scope=col>Request</th><th scope=col>Time</th></tr>"
+            body="".join(
+                f"<tr><td>{int(row['seq'])}</td><td>{html.escape(row['label'])}</td><td>{html.escape(row['source'])}</td>"
+                f"<td><code>{html.escape(row['request_id'] or '')}</code></td><td>{html.escape(_utc(row['at']))}</td></tr>"
+                for row in reversed(lanes[feed])) or f"<tr><td colspan=5>No {html.escape(self.FEED_LABELS[feed].casefold())} rows.</td></tr>"
+        return ("<section aria-labelledby=feed-heading><h2 id=feed-heading>Activity feeds</h2>"
+                f"<nav class=feeds aria-label='Activity feed filters'>{nav}</nav>"
+                "<p class=muted>Ordinary tool failures, timeouts, interrupts and cancellations are not Semantic Gate "
+                "decisions; they appear only as execution telemetry.</p>"
+                f"<table><thead>{head}</thead><tbody>{body}</tbody></table></section>")
+
+    def _control_forms(self, csrf: str) -> str:
+        controls=self.control.ledger.controls()
+        def switch(value: bool, label: str, css: str) -> str:
+            return (f"<form method=post action='/admin/controls'>{self._hidden({'csrf_token':csrf,'key':'pause_all','value':'true' if value else 'false'})}"
+                    f"<button{css} type=submit>{html.escape(label)}</button></form>")
+        def listing(key: str, label: str, field: str) -> str:
+            current=", ".join(controls.get(key) or [])
+            return (f"<form method=post action='/admin/controls'>{self._hidden({'csrf_token':csrf,'key':key})}"
+                    f"<label for={field}>{html.escape(label)}</label>"
+                    f"<input id={field} name=value type=text value='{html.escape(current,quote=True)}' autocapitalize=none spellcheck=false>"
+                    f"<button type=submit>Save</button></form>")
+        state=(f"<dl class=facts><dt>All proposals paused</dt><dd>{'yes' if controls.get('pause_all') else 'no'}</dd>"
+               f"<dt>Paused domains</dt><dd>{html.escape(', '.join(controls.get('paused_domains') or []) or 'none')}</dd>"
+               f"<dt>Revoked principals</dt><dd>{html.escape(', '.join(controls.get('revoked_principals') or []) or 'none')}</dd></dl>")
+        return (state+f"<div class=actions>{switch(True,'Pause all',' class=danger')}{switch(False,'Resume proposals','')}</div>"
+                +listing("paused_domains","Paused domains (comma separated; empty clears)","paused-domains")
+                +listing("revoked_principals","Revoked principals (comma separated; empty clears)","revoked-principals"))
+
+    @staticmethod
+    def _control_form_value(key: str, raw: str) -> Any:
+        """Translate one no-JavaScript control form field into the exact typed control value."""
+        if key in {"pause_all","auto_approval_paused"}:
+            if raw not in {"true","false"}: raise GateControlError(f"{key} must be true or false")
+            return raw=="true"
+        if key not in {"paused_domains","revoked_principals","disabled_auto_rules"}: raise GateControlError("unknown control key")
+        items=[item.strip() for item in raw.split(",") if item.strip()]
+        if len(items)>32 or any(len(item)>128 for item in items): raise GateControlError("control list is too large")
+        return items
+
+    def _panel(self, session: str, feed: str = "decisions") -> Response:
+        now=int(self.clock()); csrf=self._csrf(session); controls=self.control.ledger.controls()
         requests=self.control.list_requests(principal=self.admin_principal_id,admin=True,limit=100)
-        controls=self.control.ledger.controls(); actions=self.catalog.get("actions",{})
-        audits=self.control.ledger.audit_events(limit=200)
+        pending=[item for item in requests if item.get("state")=="waiting_for_approval"]
+        completed=[item for item in requests if item.get("state")!="waiting_for_approval"]
         status=self.status_provider()
         relay=status.get("relay",{}) if isinstance(status,Mapping) else {}
         outbox=status.get("notification_outbox",{}) if isinstance(status,Mapping) else {}
-        status_banner=(f"<section><h2>Delivery status</h2><p><b>Provider status: {html.escape(str(relay.get('status','not configured')))}</b> · "
-                       f"{int(outbox.get('pending',0))} pending · {int(outbox.get('unknown',0))} unknown</p>"
-                       f"<p>Last success: {html.escape(str(relay.get('last_success_at') or 'never'))} · Last error: {html.escape(str(relay.get('last_error') or 'none'))}</p></section>")
-        csrf=self._csrf(session)
-        def decision_buttons(item: Mapping[str,Any]) -> str:
-            if item.get("state") != "waiting_for_approval":
-                return "<span>Decision recorded; controls unavailable.</span>"
-            request_id=html.escape(str(item["request_id"]))
-            challenge=item.get("approval_challenge")
-            if not isinstance(challenge,Mapping):
-                return "<span>Decision unavailable; refresh or submit a new proposal.</span>"
-            if type(challenge.get("expires_at")) is int and challenge["expires_at"]<=int(self.clock()):
-                return "<b>Approval expired.</b> Submit a new proposal; this request cannot be revived."
-            fields={"csrf_token":csrf,**dict(challenge)}
-            hidden="".join(f"<input type=hidden name='{html.escape(str(key),quote=True)}' value='{html.escape(str(value),quote=True)}'>" for key,value in fields.items())
-            deny=f"<form method=post action='/admin/requests/{request_id}/deny'>{hidden}<button class=danger type=submit>Deny</button></form>"
-            if item.get("effective_control")=="step_up":
-                return "<button disabled>Step-up required</button> "+deny
-            approve=f"<form method=post action='/admin/requests/{request_id}/approve'>{hidden}<button type=submit>Approve once</button></form>"
-            return approve+deny
-        def notification_status(item: Mapping[str,Any]) -> str:
-            notices=self.control.ledger.notifications_for_request(str(item["request_id"]))
-            if not notices:
-                return "<span>No durable notification record.</span>"
-            rendered=[]
-            for notice in notices:
-                state=notice["state"]
-                if state=="pending": message="Notification queued; will retry after provider recovery."
-                elif state=="delivered": message="Notification delivered."
-                else: message="Notification outcome unknown; automatic retry stopped to prevent duplicates."
-                rendered.append(
-                    f"<div><b>{html.escape(message)}</b><br><code>{html.escape(notice['notification_id'])}</code>"
-                    f" · attempts {int(notice['attempts'])}</div>"
-                )
-            return "".join(rendered)
-        rows="".join(
-            f"<tr><td>{html.escape(r['request_id'])}</td><td>{html.escape(r['action'])}</td><td>{html.escape(r['requester'])}</td>"
-            f"<td>{html.escape(str(r.get('policy_control','policy')))}</td><td>{html.escape(str(r.get('minimum_control','policy')))}</td>"
-            f"<td>{html.escape(str(r.get('effective_control','policy')))}</td><td><b>{html.escape(r['state'])}</b></td>"
-            f"<td>{notification_status(r)}</td><td>{_request_review(r)}</td><td>{decision_buttons(r)}</td></tr>" for r in requests
-        )
-        action_rows="".join(f"<tr><td><code>{html.escape(a)}</code></td><td>{html.escape(str(v.get('risk','')))}</td><td>{html.escape(str(v.get('effect','')))}</td><td>{html.escape(str(v.get('summary','')))}</td></tr>" for a,v in sorted(actions.items()))
-        cred_rows="".join(f"<tr><td>{html.escape(c['credential_id'])}</td><td>{html.escape(c['adapter'])}</td><td>{html.escape(c['status'])}</td></tr>" for c in self.credentials.public_inventory())
-        audit_rows="".join(f"<tr><td>{a['seq']}</td><td>{html.escape(str(a['event']))}</td><td>{html.escape(str(a['actor']))}</td><td>{html.escape(str(a.get('request_id') or ''))}</td><td>{a['at']}</td></tr>" for a in audits)
-        page=f"""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><meta http-equiv=refresh content=20><meta name=csrf content='{csrf}'><title>Semantic Gate</title><style>body{{font:15px system-ui;background:#0b1020;color:#edf2ff;margin:0}}main{{max-width:1500px;margin:auto;padding:20px}}section{{background:#151c31;border:1px solid #2b3658;border-radius:14px;padding:16px;margin:14px 0;overflow:auto}}table{{border-collapse:collapse;width:100%}}td,th{{padding:9px;border-bottom:1px solid #2b3658;text-align:left;vertical-align:top}}button{{background:#6ea8fe;color:#07101f;border:0;border-radius:8px;padding:8px;margin:3px}}button.danger{{background:#ff7b72}}code{{color:#9bdcff}}.safe{{color:#85e89d}}.request-review{{min-width:min(620px,75vw)}}.request-review>summary{{font-weight:700;color:#9bdcff;cursor:pointer;padding:8px 0}}dl{{display:grid;grid-template-columns:max-content minmax(220px,1fr);gap:6px 12px}}dt{{color:#aab6d3;font-weight:700}}dd{{margin:0;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b1020;border:1px solid #2b3658;border-radius:8px;padding:10px}}pre.message{{font:14px/1.45 system-ui}}</style><main><h1>Semantic Gate</h1>{status_banner}<p class=safe>Execution is globally disabled; decisions simulate only.</p><section><h2>Emergency controls</h2><button class=danger data-control=pause_all data-value=true>Pause all</button><button data-control=pause_all data-value=false>Resume proposals</button><button data-list=paused_domains>Set paused domains</button><button data-list=revoked_principals>Set revoked principals</button><pre>{html.escape(json.dumps(controls,indent=2))}</pre></section><section><h2>Requests</h2><table><tr><th>ID</th><th>Action</th><th>Principal</th><th>Policy control</th><th>Caller floor</th><th>Effective control</th><th>State</th><th>Notification</th><th>Exact request</th><th>Decision</th></tr>{rows}</table></section><section><h2>Credential bindings</h2><table>{cred_rows}</table></section><section><h2>Action catalogue</h2><table><tr><th>Action</th><th>Risk</th><th>Effect</th><th>Summary</th></tr>{action_rows}</table></section><section><h2>Audit</h2><table><tr><th>#</th><th>Event</th><th>Actor</th><th>Request</th><th>Time</th></tr>{audit_rows}</table></section></main><script>document.addEventListener('click',async e=>{{let path,body={{}};if(e.target.dataset.control){{path='/admin/controls';body={{key:e.target.dataset.control,value:e.target.dataset.value==='true'}}}}else if(e.target.dataset.list){{path='/admin/controls';let raw=prompt('Comma-separated values (empty clears):','');if(raw===null)return;body={{key:e.target.dataset.list,value:raw.split(',').map(x=>x.trim()).filter(Boolean)}}}}else return;let r=await fetch(path,{{method:'POST',headers:{{'Origin':location.origin,'X-CSRF-Token':document.querySelector('meta[name=csrf]').content,'Content-Type':'application/json'}},body:JSON.stringify(body)}});if(r.ok)location.reload();else alert(await r.text())}})</script>"""
+        delivery_banner=(f"<p><b>Provider status: {html.escape(str(relay.get('status','not configured')))}</b> · "
+                         f"{int(outbox.get('pending',0))} pending · {int(outbox.get('unknown',0))} unknown</p>"
+                         f"<p class=muted>Last success: {html.escape(_utc(relay.get('last_success_at')))} · "
+                         f"Last error: {html.escape(str(relay.get('last_error') or 'none'))}</p>")
+        cards="".join(self._decision_card(item,csrf=csrf,now=now) for item in pending) or "<p class=muted>No decision is waiting.</p>"
+        history="".join(
+            f"<tr><td><code>{html.escape(str(item.get('request_id','')))}</code></td><td>{html.escape(str(item.get('action','')))}</td>"
+            f"<td>{html.escape(str(item.get('requester','')))}</td><td>{html.escape(str(item.get('effective_control','policy')))}</td>"
+            f"<td>{html.escape(str(item.get('state','')))}</td><td>{html.escape(_utc(item.get('updated_at') or item.get('created_at')))}</td></tr>"
+            for item in completed) or "<tr><td colspan=6>No completed decisions yet.</td></tr>"
+        action_rows="".join(f"<tr><td><code>{html.escape(action)}</code></td><td>{html.escape(str(value.get('risk','')))}</td><td>{html.escape(str(value.get('effect','')))}</td><td>{html.escape(str(value.get('summary','')))}</td></tr>" for action,value in sorted(self.catalog.get("actions",{}).items()))
+        cred_rows="".join(f"<tr><td>{html.escape(item['credential_id'])}</td><td>{html.escape(item['adapter'])}</td><td>{html.escape(item['status'])}</td></tr>" for item in self.credentials.public_inventory())
+        audit_events=self.control.ledger.audit_events(limit=200)
+        audit_rows="".join(f"<tr><td>{event['seq']}</td><td>{html.escape(str(event['event']))}</td><td>{html.escape(str(event['actor']))}</td><td><code>{html.escape(str(event.get('request_id') or ''))}</code></td><td>{html.escape(_utc(event['at']))}</td></tr>" for event in audit_events)
+        page=(f"<!doctype html><html lang=en><head><meta charset=utf-8>"
+              f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+              f"<meta http-equiv=refresh content=20>"
+              f"<title>Semantic Gate decisions</title><style>{_PANEL_CSS}</style></head><body>"
+              f"<a class=skip href='#pending'>Skip to pending decisions</a><main>"
+              f"<h1>Semantic Gate</h1><p class=muted>Execution is globally disabled; decisions simulate only.</p>"
+              f"<section aria-labelledby=delivery-heading><h2 id=delivery-heading>Coordinator health</h2>"
+              f"<p class=banner>Execution is globally disabled: <b>execution_enabled=false</b>, simulation only.</p>"
+              f"{delivery_banner}</section>"
+              f"<section id=pending aria-labelledby=pending-heading><h2 id=pending-heading>Pending decisions ({len(pending)})</h2>{cards}</section>"
+              f"{self._feed_section(feed,audit_events=audit_events,observations=self.control.ledger.recent_observations(limit=200))}"
+              f"{self._auto_approval_section(csrf,now=now,controls=controls)}"
+              f"<section aria-labelledby=history-heading><h2 id=history-heading>Completed history</h2>"
+              f"<table><caption class=muted>Decided requests are terminal and are never revived.</caption><thead><tr>"
+              f"<th scope=col>Request</th><th scope=col>Action</th><th scope=col>Requester</th>"
+              f"<th scope=col>Effective control</th><th scope=col>State</th><th scope=col>Updated</th></tr></thead>"
+              f"<tbody>{history}</tbody></table></section>"
+              f"<section aria-labelledby=controls-heading><h2 id=controls-heading>Emergency controls</h2>{self._control_forms(csrf)}</section>"
+              f"<section aria-labelledby=reference-heading><h2 id=reference-heading>Reference</h2>"
+              f"<details><summary>Action catalogue</summary><table><thead><tr><th scope=col>Action</th><th scope=col>Risk</th>"
+              f"<th scope=col>Effect</th><th scope=col>Summary</th></tr></thead><tbody>{action_rows}</tbody></table></details>"
+              f"<details><summary>Credential bindings</summary><table><thead><tr><th scope=col>Credential</th>"
+              f"<th scope=col>Adapter</th><th scope=col>Status</th></tr></thead><tbody>{cred_rows}</tbody></table></details>"
+              f"<details><summary>Full audit ledger</summary><table><caption class=muted>Audit rows are append-only.</caption><thead><tr><th scope=col>#</th><th scope=col>Event</th>"
+              f"<th scope=col>Actor</th><th scope=col>Request</th><th scope=col>Time</th></tr></thead>"
+              f"<tbody>{audit_rows}</tbody></table></details></section></main></body></html>")
         return Response(200,{"Content-Type":"text/html;charset=UTF-8","Cache-Control":"no-store"},page.encode())
 
     @staticmethod
     def _login_page() -> Response:
-        page="""<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>Semantic Gate login</title><style>body{font:16px system-ui;background:#0b1020;color:#edf2ff;display:grid;place-items:center;min-height:100vh}form{background:#151c31;padding:24px;border-radius:14px;border:1px solid #2b3658}label{display:block}input,button{font:inherit;padding:10px;margin:5px;border-radius:8px}button{background:#6ea8fe;border:0}</style><form method=post action=/login><h1>Semantic Gate</h1><label>Username <input name=username type=text autocomplete=username autocapitalize=none spellcheck=false required></label><label>Password <input name=password type=password autocomplete=current-password required autofocus></label><button type=submit>Sign in</button></form>"""
+        page=("<!doctype html><html lang=en><head><meta charset=utf-8>"
+              "<meta name=viewport content='width=device-width,initial-scale=1'><title>Semantic Gate login</title>"
+              "<style>{css}</style></head><body><main><form method=post action=/login><h1>Semantic Gate</h1>"
+              "<label for=username>Username</label>"
+              "<input id=username name=username type=text autocomplete=username autocapitalize=none spellcheck=false required>"
+              "<label for=password>Password</label>"
+              "<input id=password name=password type=password autocomplete=current-password required autofocus>"
+              "<button type=submit>Sign in</button></form></main></body></html>").format(css=_LOGIN_CSS)
         return Response(200,{"Content-Type":"text/html;charset=UTF-8","Cache-Control":"no-store"},page.encode())
 
     def _mcp(self, principal: Principal, message: dict) -> Response:
@@ -246,7 +466,10 @@ class SemanticGateApplication:
             if route=="/" and method=="GET":
                 try: _,session=self._admin(headers)
                 except AuthError: return Response(303,{"Location":"/login","Cache-Control":"no-store"},b"")
-                return self._panel(session)
+                query=parse_qs(urlsplit(path).query,keep_blank_values=False,max_num_fields=4)
+                selected=(query.get("feed") or ["decisions"])[0]
+                if selected not in self.FEEDS: raise GateControlError("unknown activity feed")
+                return self._panel(session,selected)
             if route=="/mcp" and method=="POST": return self._mcp(self._action_bearer(headers),self._decode(body))
             if route=="/api/v1/actions" and method=="GET":
                 p=self._action_bearer(headers); return _json(200,self.control.list_actions(p.principal_id))
@@ -280,11 +503,17 @@ class SemanticGateApplication:
                 else: return _json(404,{"error":"not found"})
                 return Response(303,{"Location":"/","Cache-Control":"no-store"},b"") if is_form else _json(200,value)
             if route=="/admin/controls" and method=="POST":
-                p=self._require_mutation(headers); value=self._decode(body)
-                if set(value)!={"key","value"}: raise GateControlError("control body must contain exactly key and value")
-                if value["key"]=="pause_all" and type(value["value"]) is not bool: raise GateControlError("pause_all must be boolean")
-                if value["key"] in {"paused_domains","revoked_principals"} and (not isinstance(value["value"],list) or any(not isinstance(item,str) or not item for item in value["value"])): raise GateControlError("control list is invalid")
-                return _json(200,self.control.set_control(value["key"],value["value"],actor=p.principal_id))
+                is_form=(_header(headers,"Content-Type") or "").split(";",1)[0].strip().casefold()=="application/x-www-form-urlencoded"
+                submitted=self._form(body) if is_form else self._decode(body)
+                csrf_token=submitted.pop("csrf_token",None) if is_form else None
+                p=self._require_mutation(headers,csrf_token=csrf_token)
+                if set(submitted)!={"key","value"}: raise GateControlError("control body must contain exactly key and value")
+                key,value=submitted["key"],submitted["value"]
+                if is_form: value=self._control_form_value(key,value)
+                if key in {"pause_all","auto_approval_paused"} and type(value) is not bool: raise GateControlError(f"{key} must be boolean")
+                if key in {"paused_domains","revoked_principals","disabled_auto_rules"} and (not isinstance(value,list) or any(not isinstance(item,str) or not item for item in value)): raise GateControlError("control list is invalid")
+                updated=self.control.set_control(key,value,actor=p.principal_id)
+                return Response(303,{"Location":"/","Cache-Control":"no-store"},b"") if is_form else _json(200,updated)
             return _json(404,{"error":"not found"})
         except GateDecisionConflict as error: return _json(409,{"error":str(error)})
         except PermissionError as error: return _json(403,{"error":str(error)})

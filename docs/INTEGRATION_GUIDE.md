@@ -110,6 +110,42 @@ provider outcomes with `delivery_unknown=True` and reconcile them rather than
 retrying automatically. Outbox state alone is not notification delivery evidence
 and does not relax the engine's existing exact evidence checks.
 
+## Auto-approval and decision cards
+
+Pass a checked-in document to the coordinator to enable policy-owned
+auto-approval:
+
+```python
+backend = CoreBackend(
+    policy,
+    approval_key=approval_key,
+    clock=clock,
+    notifier=notifier,
+    auto_approval=AutoApprovalPolicy(document),
+    auto_approval_path_resolver=host_workspace_containment_check,
+)
+app = SemanticGateApplication(..., auto_approval=backend.auto_approval)
+```
+
+`examples/auto-approval/global-simulation.json` is a generic starting point. The
+standing rule is simulation-only and cannot shrink the prohibited safety floor;
+scoped rules are the promotion path for later execution-enabled work. A path
+parameter never auto-approves unless the host supplies a resolver that confirms
+containment, because the matcher must not touch the filesystem.
+
+For out-of-band notices, project a bounded decision card instead of a bare
+template string:
+
+```python
+card = build_decision_card(request, catalog=catalog, now=now, panel_reference=panel_url)
+notifier.send(render_decision_card_text(card))
+```
+
+Never add raw parameters, prompts, commands, paths, message bodies or
+credentials to that notice. Observation submitters may pass an optional
+bounded `correlation_id` so root and detail telemetry collapse into one panel
+row instead of looking like two separate failures.
+
 ## Private deployment boundary
 
 Keep generic workflow, engine, SDK, MCP, broker and plugin abstractions in this repository. Private consumers should keep real identities, hosts, IPs, credentials, action catalogues, node assignments, service wiring and migration state in their own repository. Private integrations can publish generalized examples here after removing deployment assumptions and identifiers.

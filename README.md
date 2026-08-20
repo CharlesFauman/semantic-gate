@@ -86,6 +86,24 @@ through the gateway directly.
 - **Provider health projection:** deployments may supply bounded outbox/relay
   status for `/health` and the authenticated panel. Delivery ambiguity remains
   explicit rather than being retried as though a send definitely failed.
+- **Policy-owned auto-approval:** an optional checked-in document may auto-approve
+  the approval gate. The bundled standing rule is simulation-only: it applies to
+  catalogued actions above an explicit prohibited safety floor, never authorizes
+  execution, and cannot shrink that floor. Scoped rules bind one canonical
+  repository, exact refs, declared deploy target/environment, host-authenticated
+  requester/node, closed parameter constraints and a commit identity. Rules are
+  host-owned; agents cannot create, edit, enable, disable or pause them.
+- **Auto-approval is not execution:** matched requests still pass schema
+  validation, prechecks, the approval gate, the post-approval recheck and
+  single-request evidence/audit. `execution_enabled=false` remains a separate
+  hard stop.
+- **Bounded decision cards:** out-of-band notices project only closed,
+  schema-owned presentation fields, deterministically sanitized, length-bounded
+  and escaped. Parameters, prompts, commands, paths, message bodies and
+  credentials are never projected.
+- **Separated failure feeds:** gate decisions, policy denials, gate errors,
+  withdrawals and ordinary tool telemetry are distinct. A nonzero exit, timeout,
+  interrupt or cancellation is never presented as a Semantic Gate decision.
 - **Separated tool roles:** read gates and effectful targets live in different registries.
 - **Dual execution control:** live execution needs policy enablement **and** a host-owned `ExecutionAuthority` object.
 - **Safe MCP defaults:** the CLI MCP server has no trusted approval verifier or execution authority.
@@ -154,7 +172,8 @@ See [`examples/`](examples/) for calendar, purchase and device-control flows.
 - proposal/status/cancellation REST endpoints;
 - authenticated, idempotent audit-only permission observations;
 - proposal-only MCP over HTTP;
-- a mobile control panel for simulation review;
+- a keyboard-accessible, JavaScript-free control panel that leads with pending
+  decisions and separates decision, denial and telemetry feeds;
 - SQLite request snapshots, audit events, emergency controls and a durable
   notification-outbox foundation;
 - host-derived principal capabilities;

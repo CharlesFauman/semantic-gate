@@ -262,6 +262,12 @@ class Ledger:
     def _observation_payload(observation: dict) -> dict:
         return {key:value for key,value in observation.items() if key!="received_at"}
 
+    def recent_observations(self, *, limit: int = 100) -> list[dict]:
+        limit=max(1,min(int(limit),1000))
+        with self._lock:
+            rows=self._db.execute("SELECT observation_json FROM observations ORDER BY received_at DESC,rowid DESC LIMIT ?",(limit,)).fetchall()
+        return [json.loads(row[0]) for row in reversed(rows)]
+
     def record_observation(self, observation: dict) -> dict:
         encoded=self._json(observation); comparable=self._observation_payload(observation)
         with self._lock,self._db:
@@ -303,7 +309,7 @@ class Ledger:
         return count
 
     def set_control(self, key: str, value: Any, *, actor: str, now: int):
-        if key not in {"pause_all", "paused_domains", "revoked_principals"}:
+        if key not in {"pause_all", "paused_domains", "revoked_principals", "auto_approval_paused", "disabled_auto_rules"}:
             raise ValueError("unknown control")
         with self._lock, self._db:
             self._db.execute(
@@ -319,7 +325,8 @@ class Ledger:
             self._prune_audit_locked()
 
     def controls(self) -> dict:
-        result = {"pause_all": False, "paused_domains": [], "revoked_principals": []}
+        result = {"pause_all": False, "paused_domains": [], "revoked_principals": [],
+                  "auto_approval_paused": False, "disabled_auto_rules": []}
         with self._lock:
             rows = self._db.execute("SELECT key,value_json FROM controls").fetchall()
         for row in rows:

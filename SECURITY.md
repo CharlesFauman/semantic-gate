@@ -39,6 +39,23 @@ access to the downstream effectful tools that Semantic Gate is meant to gate.
     completing or releasing another attempt. `unknown` delivery is terminal for
     automatic claims because retrying an ambiguous send could duplicate it.
 
+20. Auto-approval is policy-owned and default-deny. It supplies approval evidence
+    for one exact request bound to rule ID, immutable rule version, request
+    ID/hash and commit identity; it never authorizes execution, never widens
+    policy and is never reachable from an agent-callable surface. Pausing,
+    enabling and disabling rules are authenticated human control-plane
+    operations with the same Origin and session-CSRF requirements as decisions.
+21. The prohibited safety floor must be declared in full and cannot be shrunk.
+    Credentials/secrets, spending, external human communication, destructive or
+    irreversible git, undeclared infrastructure effects and arbitrary
+    terminal/shell/command actions always require a human. The standing rule
+    additionally requires `execution_enabled=false`; catalogue membership and
+    catalogue prohibitions are enforced, and there is no wildcard that bypasses
+    them.
+22. Decision-card projection is closed and bounded. Only action-schema-owned
+    presentation fields are projected, sanitized to a printable allowlist,
+    length-bounded and escaped. A changed commit voids auto-approval evidence.
+
 ## Host responsibilities
 
 A production host must:
@@ -77,6 +94,8 @@ validation to HTTP and MCP bodies and emits no CORS policy.
 ## What the library does not yet provide
 
 - crash-resumable transactional engine state for live execution;
+- filesystem symlink containment for path parameters (a policy matcher must not
+  touch disk; supply a host path resolver and enforce containment at the broker);
 - distributed consensus or locks across coordinator replicas;
 - built-in identity provider or biometric verification;
 - built-in notification provider (the SQLite outbox is transport-neutral only);

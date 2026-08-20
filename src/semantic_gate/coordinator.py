@@ -8,8 +8,8 @@ import json
 import secrets
 from typing import Any
 
-from .engine import ApprovalRejected, GatewayEngine, ToolRegistry
-from .engine import RecordingNotifier
+from . import autoapproval
+from .engine import ApprovalRejected, GatewayEngine, RecordingNotifier, ToolRegistry
 
 
 class HostApprovalVerifier:
@@ -39,10 +39,13 @@ class HostApprovalVerifier:
 class CoreBackend:
     APPROVAL_ABSOLUTE_CAP_SECONDS = 6 * 60 * 60
 
-    def __init__(self, policy: dict, *, approval_key: bytes, clock, notifier=None):
+    def __init__(self, policy: dict, *, approval_key: bytes, clock, notifier=None, auto_approval=None, auto_approval_path_resolver=None):
         self.clock = clock
         self.verifier = HostApprovalVerifier(approval_key)
+        self.auto_approval = auto_approval
+        self._auto_approval_path_resolver = auto_approval_path_resolver
         self._decision_challenges: dict[str,dict] = {}
+        self._trusted_nodes: dict[str,str] = {}
         registry = ToolRegistry()
         actions = set(policy["workflows"])
 
@@ -68,6 +71,10 @@ class CoreBackend:
 
     def request_action(self, **kwargs):
         request=self.engine.request_action(**kwargs)
+        trusted=kwargs.get("trusted_context")
+        node=trusted.get("node") if isinstance(trusted,dict) else None
+        if isinstance(node,str) and node:
+            self._trusted_nodes[request["request_id"]]=node
         if request.get("state")=="waiting_for_approval":
             notification=next((gate for gate in request["gates"] if gate["kind"]=="notify"),None)
             evidence=(notification or {}).get("evidence") or {}
@@ -103,6 +110,49 @@ class CoreBackend:
             raise ApprovalRejected("decision challenge is already bound to a different delivery")
         self._decision_challenges[request_id]=challenge
         return dict(challenge)
+
+    def _with_challenge(self, request: dict) -> dict:
+        if "approval_challenge" in request:
+            return request
+        challenge = self.approval_challenge(request["request_id"])
+        return request if challenge is None else {**request, "approval_challenge": challenge}
+
+    def auto_approval_decision(self, request: dict, *, node: str | None = None, paused: bool = False, disabled_rules=()) -> dict | None:
+        """Dry-runnable, side-effect-free auto-approval evaluation for one exact request."""
+        if self.auto_approval is None:
+            return None
+        return autoapproval.evaluate(
+            self._with_challenge(request),
+            policy=self.auto_approval,
+            now=int(self.clock()),
+            node=node or self._trusted_nodes.get(request.get("request_id")),
+            policy_version=self.auto_approval.version,
+            paused=paused,
+            disabled_rules=disabled_rules,
+            path_resolver=self._auto_approval_path_resolver,
+        )
+
+    def auto_approve(self, request_id: str, decision: dict, *, node: str | None = None) -> tuple[dict, dict, dict]:
+        """Ingest single-request auto-approval evidence through the ordinary approval gate."""
+        if self.auto_approval is None:
+            raise ApprovalRejected("auto-approval policy is not configured")
+        if not isinstance(decision, dict) or not decision.get("matched"):
+            raise ApprovalRejected("auto-approval decision did not match a declared rule")
+        request = self._with_challenge(self.engine.get_request(request_id))
+        fresh = self.auto_approval_decision(request, node=node)
+        if fresh is None or not fresh["matched"]:
+            raise ApprovalRejected(f"auto-approval no longer matches: {(fresh or {}).get('reason_code', 'unavailable')}")
+        if fresh["evidence_binding"] != decision["evidence_binding"]:
+            raise ApprovalRejected("auto-approval binding changed since the match")
+        evidence = autoapproval.approval_evidence(fresh, request)
+        commit = request.get("parameters", {}).get("commit")
+        if not autoapproval.commit_binding_valid(evidence, commit=commit if isinstance(commit, str) else None):
+            raise ApprovalRejected("auto-approval commit identity changed since the match")
+        evidence["signature"] = self.verifier.sign(evidence)
+        decided = self.engine.ingest_trusted_approval(request_id, evidence)
+        self._decision_challenges.pop(request_id, None)
+        self._trusted_nodes.pop(request_id, None)
+        return decided, evidence, autoapproval.audit_metadata(fresh, request)
 
     def approval_challenge(self, request_id: str) -> dict | None:
         challenge=self._decision_challenges.get(request_id)

@@ -20,6 +20,7 @@ class GateControl:
     REQUEST_REQUIRED_FIELDS = {"action", "parameters", "context", "idempotency_key"}
     REQUEST_OPTIONAL_FIELDS = {"minimum_control"}
     OBSERVATION_FIELDS = {"event_id","phase","operation","semantic_class","outcome","occurred_at","metadata"}
+    OBSERVATION_OPTIONAL_FIELDS = {"correlation_id"}
     OBSERVATION_METADATA_KEYS = {"surface","node","harness","duration_ms","status","error_type","dropped_events","toolset","version"}
 
     def __init__(self, backend: Any, ledger: Ledger, *, clock):
@@ -87,13 +88,48 @@ class GateControl:
         request["updated_at"] = int(self.clock())
         request.pop("trusted_context", None)
         self._attach_approval_challenge(request)
+        decision = self._auto_approval_dry_run(request)
         self.ledger.record_request(request, event="requested", actor=principal)
+        if decision is not None and decision.get("matched"):
+            return self._apply_auto_approval(request, decision)
         return request
+
+    def _auto_approval_dry_run(self, request: dict) -> dict | None:
+        """Evaluate the policy-owned auto-approval rules without any side effect."""
+        decide = getattr(self.backend, "auto_approval_decision", None)
+        if decide is None or request.get("state") != "waiting_for_approval":
+            return None
+        controls = self.ledger.controls()
+        decision = decide(
+            request,
+            paused=controls.get("auto_approval_paused") is True,
+            disabled_rules=tuple(controls.get("disabled_auto_rules") or ()),
+        )
+        if decision is None:
+            return None
+        request["auto_approval"] = {"matched": bool(decision.get("matched")),
+                                    "reason_code": decision.get("reason_code"),
+                                    "reason": decision.get("reason")}
+        return decision
+
+    def _apply_auto_approval(self, request: dict, decision: dict) -> dict:
+        """Ingest single-request auto-approval evidence and record immutable audit.
+
+        Auto-approval supplies approval evidence for this exact request only. It never
+        authorizes execution and never bypasses schema, precheck or post-approval recheck.
+        """
+        decided, _evidence, audit = self.backend.auto_approve(request["request_id"], decision)
+        decided["updated_at"] = int(self.clock())
+        decided.pop("trusted_context", None)
+        decided["auto_approval"] = {**request["auto_approval"], "rule_id": audit.get("rule_id"),
+                                    "rule_version": audit.get("rule_version"), "authorizes_execution": False}
+        self.ledger.record_request(decided, event="auto_approved", actor="policy:auto-approval", metadata=audit)
+        return decided
 
     def observe(self, *, principal: str, payload: Mapping[str, Any]):
         if not isinstance(payload,Mapping):
             raise GateControlError("observation payload must be an object")
-        unknown=set(payload)-self.OBSERVATION_FIELDS; missing=self.OBSERVATION_FIELDS-set(payload)
+        unknown=set(payload)-self.OBSERVATION_FIELDS-self.OBSERVATION_OPTIONAL_FIELDS; missing=self.OBSERVATION_FIELDS-set(payload)
         if unknown: raise GateControlError(f"unknown observation field(s): {sorted(unknown)}")
         if missing: raise GateControlError(f"missing observation field(s): {sorted(missing)}")
         event_id=payload["event_id"]
@@ -109,7 +145,11 @@ class GateControl:
             if key not in self.OBSERVATION_METADATA_KEYS: raise GateControlError(f"metadata key is not allowed: {key}")
             if type(value) not in {str,int,bool,type(None)} or isinstance(value,str) and not re.fullmatch(r"[A-Za-z0-9_.:/-]{0,128}",value) or type(value) is int and not 0<=value<=2**63-1:
                 raise GateControlError("metadata values must be flat scalar labels")
+        correlation_id=payload.get("correlation_id")
+        if correlation_id is not None and not (isinstance(correlation_id,str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}",correlation_id)):
+            raise GateControlError("correlation_id is invalid")
         observation={key:payload[key] for key in self.OBSERVATION_FIELDS}
+        observation["correlation_id"]=correlation_id
         observation["metadata"]=dict(metadata); observation["principal"]=principal; observation["received_at"]=int(self.clock())
         return self.ledger.record_observation(observation)
 

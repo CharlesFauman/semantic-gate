@@ -120,6 +120,36 @@ for complete simulation and policy review, but live execution requires a future
 transactional engine/store integration with durable gate evidence, execution
 claims and downstream idempotency.
 
+### Auto-approval matcher
+
+`autoapproval.py` is a pure deterministic evaluator over one exact request. A
+checked-in document declares an immutable version, an optional standing
+simulation-only rule and zero or more scoped rules. Matching is dry-runnable and
+explains itself with closed reason codes that never echo parameter values.
+
+```text
+shared guards (policy enabled, human pause, policy version, waiting state,
+               exact challenge, step-up, arbitrary-command hard stop)
+  → scoped rules (canonical repository, exact refs, declared target/environment,
+                  requester/node, commit identity, closed parameter constraints)
+  → standing simulation rule (catalogue membership, catalogue prohibitions,
+                              prohibited safety floor, sensitive-parameter floor)
+  → single-request evidence bound to rule ID/version, request ID/hash and commit
+```
+
+The coordinator re-evaluates at ingestion time, so a scope or commit change
+between match and ingestion voids the evidence. Approval evidence carries
+`authorizes_execution: false`; execution still requires enabling policy and a
+host-owned `ExecutionAuthority`.
+
+### Decision-card projection and panel feeds
+
+`projection.py` builds bounded decision cards for out-of-band notices and for the
+authenticated panel, and classifies activity into separate feeds. Observations
+from the audit lane are always execution telemetry: an ordinary tool failure,
+timeout, interrupt or cancellation is never labelled a gate decision, and root
+plus detail observations sharing a correlation ID collapse into one row.
+
 ### Distributed nodes and plugins
 
 The coordinator is the policy decision point. A node broker is a policy

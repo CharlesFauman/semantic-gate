@@ -3,26 +3,25 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
-import subprocess
 import tempfile
 import unittest
 from urllib.parse import urlencode
 from pathlib import Path
 
 from semantic_gate.auth import CapabilityAuthority
+from semantic_gate.autoapproval import PROHIBITED_CLASSES, AutoApprovalPolicy
 from semantic_gate.controller import GateControl
 from semantic_gate.credentials import CredentialRegistry
-from semantic_gate.server import SemanticGateApplication
+from semantic_gate.server import PANEL_COLORS, PANEL_CONTRAST_PAIRS, SemanticGateApplication
 from semantic_gate.storage import Ledger
 
 
 class FakeBackend:
-    def __init__(self): self.requests={}
+    def __init__(self): self.requests={}; self.auto_decision=None
     def list_actions(self, principal): return [{"action":"device.power_off"}]
     def explain_action(self, action, principal): return {"action":action,"execution_enabled":False}
     def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key, minimum_control="policy"):
-        request={"request_id":"req_1","request_hash":"h"*64,"action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"policy_control":"ask","effective_control":"step_up" if minimum_control=="step_up" else "ask","gates":[{"id":"approval","kind":"approval","status":"waiting","evidence":{"ttl_seconds":300}}]}
+        request={"request_id":"req_"+re.sub(r"[^a-z0-9]","",idempotency_key),"request_hash":"h"*64,"action":action,"requester":requester,"state":"waiting_for_approval","created_at":100,"parameters":parameters,"context":context,"minimum_control":minimum_control,"policy_control":"ask","effective_control":"step_up" if minimum_control=="step_up" else "ask","gates":[{"id":"approval","kind":"approval","status":"waiting","evidence":{"ttl_seconds":300}}]}
         request["approval_challenge"]={"request_id":request["request_id"],"request_hash":request["request_hash"],"approval_gate_id":"approval","expires_at":400}
         self.requests[request["request_id"]]=request; return dict(request)
     def approval_challenge(self, request_id): return dict(self.requests[request_id]["approval_challenge"])
@@ -30,6 +29,11 @@ class FakeBackend:
     def cancel_request(self, request_id, requester): self.requests[request_id]["state"]="cancelled"; return dict(self.requests[request_id])
     def approve_request(self, request_id, actor, challenge): self.requests[request_id]["state"]="simulated"; return dict(self.requests[request_id])
     def deny_request(self, request_id, actor, challenge): self.requests[request_id]["state"]="denied"; return dict(self.requests[request_id])
+    def auto_approval_decision(self, request, *, paused=False, disabled_rules=()): return None if self.auto_decision is None else dict(self.auto_decision)
+    def auto_approve(self, request_id, decision):
+        self.requests[request_id]["state"]="simulated"
+        audit={"auto_approved":True,"rule_id":decision["rule_id"],"rule_version":1,"policy_version":7,"request_id":request_id,"request_hash":"h"*64,"commit":None,"action_class":"global_simulation","reason_code":decision["reason_code"],"authorizes_execution":False}
+        return dict(self.requests[request_id]),{"evidence_id":"auto_1"},audit
 
 
 class SemanticGateApplicationTests(unittest.TestCase):
@@ -40,7 +44,7 @@ class SemanticGateApplicationTests(unittest.TestCase):
         principals={"agent":{"role":"agent","enabled":True},"observer":{"role":"observer","enabled":True},"control":{"role":"admin","enabled":True}}
         self.authority=CapabilityAuthority(bytes.fromhex("33"*32),principals)
         credentials=root/"credentials.json"; credentials.write_text(json.dumps({"credentials":{"device":{"adapter":"example","kind":"token","value":"never-render-me"}}}))
-        self.app=SemanticGateApplication(self.control,self.authority,CredentialRegistry(credentials),catalog={"actions":{"device.power_off":{"risk":"R2","summary":"Power off"}}},admin_password="correct horse battery staple",origins=["https://control.example","http://127.0.0.1:18790"],clock=lambda:100)
+        self.app=SemanticGateApplication(self.control,self.authority,CredentialRegistry(credentials),catalog={"actions":{"device.power_off":{"risk":"R2","effect":"write","summary":"Power off an allowlisted display","presentation":{"proposed_effect":"Power off the allowlisted meeting-room display","reason":"Display is idle outside booked hours","node":"node-example-1","safe_target_field":"target","safe_target_values":["example-display"],"spends":False,"communicates":False,"changes_state":True}}}},admin_password="correct horse battery staple",origins=["https://control.example","http://127.0.0.1:18790"],clock=lambda:100)
         self.agent={"Authorization":f"Bearer {self.authority.token_for('agent')}"}
         self.observer={"Authorization":f"Bearer {self.authority.token_for('observer')}"}
     def tearDown(self): self.ledger.close(); self.tmp.cleanup()
@@ -131,10 +135,7 @@ class SemanticGateApplicationTests(unittest.TestCase):
         page=self.call("GET","/",{"Cookie":cookie}); text=page.body.decode()
         self.assertIn("Semantic Gate",text); self.assertIn("device.power_off",text); self.assertNotIn("never-render-me",text)
         self.assertIn("Audit",text); self.assertIn("Pause all",text)
-        scripts=re.findall(r"<script>(.*?)</script>",text,flags=re.DOTALL)
-        self.assertEqual(1,len(scripts))
-        self.assertNotIn("filter(Boolean)}else return",scripts[0])
-        self.assertIn("filter(Boolean)}}else return",scripts[0])
+        self.assertEqual([],re.findall(r"<script",text))
         request=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"two"}).json()
         self.assertEqual(403,self.call("POST",f"/admin/requests/{request['request_id']}/approve",{"Cookie":cookie},{}).status)
         headers={"Cookie":cookie,"Origin":"https://control.example","X-CSRF-Token":csrf}
@@ -155,15 +156,28 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertEqual(200,case_insensitive.status)
         self.assertTrue(case_insensitive.json()["pause_all"])
 
-    @unittest.skipUnless(shutil.which("node"),"node is needed for the panel JavaScript syntax check")
-    def test_rendered_panel_javascript_is_syntax_valid(self):
+    def test_emergency_controls_need_no_javascript(self):
         login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
         cookie=login.headers["Set-Cookie"].split(";",1)[0]
-        self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"syntax"})
         panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
-        script=re.findall(r"<script>(.*?)</script>",panel,flags=re.DOTALL)[0]
-        completed=subprocess.run(["node","--check","-"],input=script,text=True,capture_output=True,check=False)
-        self.assertEqual(0,completed.returncode,completed.stderr)
+        self.assertNotIn("<script",panel)
+        self.assertNotIn("data-control=",panel)
+        self.assertNotIn("prompt(",panel)
+        csrf=re.search(r"name='csrf_token' value='([^']+)'",panel).group(1)
+        origin={"Cookie":cookie,"Origin":"https://control.example"}
+        self.assertEqual(403,self.form("POST","/admin/controls",{"Cookie":cookie},{"csrf_token":csrf,"key":"pause_all","value":"true"}).status)
+        paused=self.form("POST","/admin/controls",origin,{"csrf_token":csrf,"key":"pause_all","value":"true"})
+        self.assertEqual(303,paused.status); self.assertEqual("/",paused.headers["Location"])
+        self.assertTrue(self.ledger.controls()["pause_all"])
+        self.assertEqual(303,self.form("POST","/admin/controls",origin,{"csrf_token":csrf,"key":"pause_all","value":"false"}).status)
+        self.assertFalse(self.ledger.controls()["pause_all"])
+        self.form("POST","/admin/controls",origin,{"csrf_token":csrf,"key":"paused_domains","value":"device, purchase"})
+        self.assertEqual(["device","purchase"],self.ledger.controls()["paused_domains"])
+        self.form("POST","/admin/controls",origin,{"csrf_token":csrf,"key":"paused_domains","value":""})
+        self.assertEqual([],self.ledger.controls()["paused_domains"])
+        for invalid in ({"key":"pause_all","value":"maybe"},{"key":"unknown_key","value":"true"}):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(400,self.form("POST","/admin/controls",origin,{"csrf_token":csrf,**invalid}).status)
 
     def test_panel_shows_durable_notification_delivery_and_recovery_status(self):
         login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
@@ -226,6 +240,179 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertIn("h"*64,text)
         self.assertIn("Approval expires at",text)
         self.assertIn("If this request expires, submit a new proposal",text)
+
+    def test_panel_leads_with_pending_decision_work_that_needs_no_javascript(self):
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]; csrf=login.headers["X-CSRF-Token"]
+        pending=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{"summary":"free text written by the model","target":"example-display","details":{}},"context":{},"idempotency_key":"pending display"}).json()
+        self.ledger.enqueue_notification(request_id=pending["request_id"],request_hash=pending["request_hash"],notify_gate_id="notify",recipient="human_owner",template_hash="a"*64,now=90)
+        history=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{"summary":"already decided","target":"example-display","details":{}},"context":{},"idempotency_key":"history one"}).json()
+        denied=self.call("POST",f"/admin/requests/{history['request_id']}/deny",{"Cookie":cookie,"Origin":"https://control.example","X-CSRF-Token":csrf},history["approval_challenge"])
+        self.assertEqual("denied",denied.json()["state"])
+        text=self.call("GET","/",{"Cookie":cookie}).body.decode()
+
+        # Pending decisions come first; decided work is demoted to secondary history.
+        self.assertLess(text.index("Pending decisions (1)"),text.index(pending["request_id"]))
+        self.assertLess(text.index(pending["request_id"]),text.index("Completed history"))
+        self.assertIn(history["request_id"],text[text.index("Completed history"):])
+
+        card=text[text.index("Pending decisions (1)"):text.index("Completed history")]
+        for expected in ("device.power_off","Power off the allowlisted meeting-room display","Display is idle outside booked hours",
+                         "Safe target","example-display","Requester","agent","node-example-1","Risk","R2",
+                         "Policy control","Caller floor","Effective control","Expires","in 5 min",
+                         "Notification queued","Approve once","Deny"):
+            with self.subTest(expected=expected): self.assertIn(expected,card)
+
+        # Accessible landmarks, headings, responsive layout and visible focus.
+        for expected in ("<html lang=en>","name=viewport","Skip to pending decisions","<main","<h1","<h2","aria-labelledby","@media","focus-visible"):
+            with self.subTest(expected=expected): self.assertIn(expected,text)
+
+        # No JavaScript anywhere on the critical decision surface.
+        self.assertNotIn("<script",text); self.assertNotIn("javascript:",text); self.assertNotIn("onclick",text)
+
+        # Approve/deny remain exact ordinary POST forms bound to the immutable challenge.
+        self.assertIn(f"action='/admin/requests/{pending['request_id']}/approve'",card)
+        self.assertIn(f"action='/admin/requests/{pending['request_id']}/deny'",card)
+        self.assertIn(f"name='request_hash' value='{'h'*64}'",card)
+        fields={key:str(value) for key,value in pending["approval_challenge"].items()}
+        form_csrf=re.search(r"name='csrf_token' value='([^']+)'",card).group(1)
+        self.assertEqual(403,self.form("POST",f"/admin/requests/{pending['request_id']}/approve",{"Cookie":cookie},{"csrf_token":form_csrf,**fields}).status)
+        self.assertEqual(403,self.form("POST",f"/admin/requests/{pending['request_id']}/approve",{"Cookie":cookie,"Origin":"https://evil.example"},{"csrf_token":form_csrf,**fields}).status)
+        self.assertEqual(403,self.form("POST",f"/admin/requests/{pending['request_id']}/approve",{"Cookie":cookie,"Origin":"https://control.example"},{"csrf_token":"wrong",**fields}).status)
+        self.assertEqual(409,self.form("POST",f"/admin/requests/{pending['request_id']}/approve",{"Cookie":cookie,"Origin":"https://control.example"},{"csrf_token":form_csrf,**fields,"request_hash":"g"*64}).status)
+        approved=self.form("POST",f"/admin/requests/{pending['request_id']}/approve",{"Cookie":cookie,"Origin":"https://control.example"},{"csrf_token":form_csrf,**fields})
+        self.assertEqual(303,approved.status)
+        self.assertEqual("simulated",self.control.backend.requests[pending["request_id"]]["state"])
+
+    def test_pending_card_withholds_message_bodies_that_only_the_exact_review_shows(self):
+        self.app.catalog={"actions":{"communication.send":{"risk":"R3","effect":"write","summary":"Send one reviewed message","presentation":{"proposed_effect":"Send one email to the reviewed supplier address","reason":"The purchase needs written supplier confirmation","node":"node-example-2","safe_target_field":"target","safe_target_values":["support@example.test"],"spends":False,"communicates":True,"changes_state":False}}}}
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        parameters={"summary":"Email supplier before purchase","target":"support@example.test","details":{"channel":"email","recipient":"support@example.test","subject":"Exact component confirmation","body":"Hello supplier,\nPlease confirm parts.","listing_id":"LIST-123","attachments":["requirements.pdf"]}}
+        self.call("POST","/api/v1/requests",self.agent,{"action":"communication.send","parameters":parameters,"context":{},"idempotency_key":"card leakage"})
+        text=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        card=text[text.index("Pending decisions (1)"):text.index("<details class=request-review")]
+        for expected in ("Send one email to the reviewed supplier address","support@example.test","The purchase needs written supplier confirmation","Can communicate externally","R3"):
+            with self.subTest(expected=expected): self.assertIn(expected,card)
+        for leaked in ("Hello supplier","Please confirm parts","LIST-123","requirements.pdf","Exact component confirmation","Email supplier before purchase","Canonical normalized parameters"):
+            with self.subTest(leaked=leaked): self.assertNotIn(leaked,card)
+        self.assertIn("Hello supplier,",text)
+        self.assertIn("Canonical normalized parameters",text)
+
+    def test_panel_is_responsive_and_keyboard_accessible(self):
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        text=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        for expected in ("<html lang=en>","<meta charset=utf-8>","name=viewport","class=skip href='#pending'",
+                         "@media (max-width:640px)",":focus-visible","<th scope=col>","<label for=paused-domains>",
+                         "min-height:44px"):
+            with self.subTest(expected=expected): self.assertIn(expected,text)
+        self.assertNotIn("min-width:min(620px,75vw)",text)
+        self.assertEqual(1,text.count("<h1"))
+        login_page=self.call("GET","/login").body.decode()
+        self.assertIn("<html lang=en>",login_page); self.assertIn(":focus-visible",login_page)
+        self.assertIn("<label for=username>",login_page); self.assertIn("<label for=password>",login_page)
+
+    def test_panel_palette_meets_wcag_contrast(self):
+        def channel(value):
+            value/=255
+            return value/12.92 if value<=0.04045 else ((value+0.055)/1.055)**2.4
+        def luminance(colour):
+            red,green,blue=(channel(int(colour[index:index+2],16)) for index in (1,3,5))
+            return 0.2126*red+0.7152*green+0.0722*blue
+        rendered=self.call("GET","/login").body.decode()
+        for foreground,background in PANEL_CONTRAST_PAIRS:
+            with self.subTest(pair=(foreground,background)):
+                first,second=luminance(PANEL_COLORS[foreground]),luminance(PANEL_COLORS[background])
+                ratio=(max(first,second)+0.05)/(min(first,second)+0.05)
+                self.assertGreaterEqual(ratio,4.5)
+        for colour in PANEL_COLORS.values():
+            with self.subTest(colour=colour): self.assertRegex(colour,r"^#[0-9a-f]{6}$")
+        self.assertIn(PANEL_COLORS["page"],rendered)
+
+    def standing_policy(self):
+        return AutoApprovalPolicy({"version":7,"enabled":True,"rules":[],"global_simulation_rule":{
+            "rule_id":"rule-global-simulation","version":1,"prohibited_classes":sorted(PROHIBITED_CLASSES),
+            "requesters":["agent"],"nodes":["node-example-1"],"expires_at":90_000,"review_by":80_000}})
+
+    def test_panel_shows_the_global_standing_rule_simulation_stop_and_prohibited_floor(self):
+        self.app.auto_approval=self.standing_policy()
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        for expected in ("GLOBAL AUTO-APPROVE","simulation only","execution_enabled=false","Auto-approval rules",
+                         "rule-global-simulation","version 1","Enabled","Next review","Expires",
+                         "Always asks a human","Pause auto-approval",
+                         "credentials","spending","external_communication","destructive_git",
+                         "undeclared_infrastructure","arbitrary_command"):
+            with self.subTest(expected=expected): self.assertIn(expected,panel)
+        self.assertNotIn("<script",panel)
+        csrf=re.search(r"name='csrf_token' value='([^']+)'",panel).group(1)
+        origin={"Cookie":cookie,"Origin":"https://control.example"}
+        self.assertEqual(403,self.form("POST","/admin/controls",{"Cookie":cookie},{"csrf_token":csrf,"key":"auto_approval_paused","value":"true"}).status)
+        paused=self.form("POST","/admin/controls",origin,{"csrf_token":csrf,"key":"auto_approval_paused","value":"true"})
+        self.assertEqual(303,paused.status)
+        self.assertIs(True,self.ledger.controls()["auto_approval_paused"])
+        self.assertIn("Auto-approval is paused",self.call("GET","/",{"Cookie":cookie}).body.decode())
+        self.form("POST","/admin/controls",origin,{"csrf_token":csrf,"key":"disabled_auto_rules","value":"rule-global-simulation"})
+        self.assertIn("Disabled",self.call("GET","/",{"Cookie":cookie}).body.decode())
+        self.form("POST","/admin/controls",origin,{"csrf_token":csrf,"key":"auto_approval_paused","value":"false"})
+        self.assertIs(False,self.ledger.controls()["auto_approval_paused"])
+
+    def test_agents_cannot_reach_any_auto_approval_rule_mutation_surface(self):
+        self.app.auto_approval=self.standing_policy()
+        tools=[tool["name"] for tool in self.call("POST","/mcp",self.agent,{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).json()["result"]["tools"]]
+        self.assertEqual(["list_actions","explain_action","request_action","get_request","cancel_request"],tools)
+        for path in ("/api/v1/auto-approval-rules","/api/v1/auto-approval/pause","/admin/auto-approval-rules"):
+            with self.subTest(path=path):
+                self.assertIn(self.call("POST",path,self.agent,{"enabled":True}).status,{403,404})
+        self.assertEqual(403,self.call("POST","/admin/controls",self.agent,{"key":"auto_approval_paused","value":False}).status)
+        self.assertEqual(403,self.form("POST","/admin/controls",{},{"key":"auto_approval_paused","value":"false"}).status)
+        self.assertIs(False,self.ledger.controls()["auto_approval_paused"])
+
+    def test_pending_card_explains_why_auto_approval_did_not_apply(self):
+        self.control.backend.auto_decision={"matched":False,"reason_code":"prohibited_class_requires_human",
+                                            "reason":"The action falls inside the prohibited safety floor. (class: spending)"}
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"dry run"})
+        panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        card=panel[panel.index("Pending decisions (1)"):panel.index("<details class=request-review")]
+        self.assertIn("Auto-approval did not apply",card)
+        self.assertIn("prohibited safety floor",card)
+        self.assertIn("spending",card)
+
+    def test_panel_separates_gate_decisions_policy_denials_and_execution_telemetry(self):
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]; csrf=login.headers["X-CSRF-Token"]
+        pending=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"feed pending"}).json()
+        observation={"event_id":"call-1","correlation_id":"corr-1","phase":"completed","operation":"code.edit_file",
+                     "semantic_class":"code.change.write","outcome":"failed","occurred_at":99,
+                     "metadata":{"surface":"harness","error_type":"nonzero_exit"}}
+        self.call("POST","/api/v1/audit-observations",self.agent,observation)
+        self.call("POST","/api/v1/audit-observations",self.agent,{**observation,"event_id":"call-1-detail","occurred_at":100})
+        panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertLess(panel.index("Pending decisions (1)"),panel.index("Policy denials (0)"))
+        self.assertIn("Execution telemetry (1)",panel)
+        self.assertIn("Gate errors (0)",panel)
+        self.assertIn("?feed=denials",panel); self.assertIn("?feed=telemetry",panel)
+        self.assertIn("Ordinary tool failures, timeouts, interrupts and cancellations are not Semantic Gate decisions",panel)
+        self.assertIn("Coordinator health",panel)
+        self.assertIn("<summary>Full audit ledger</summary>",panel)
+        telemetry=self.call("GET","/?feed=telemetry",{"Cookie":cookie}).body.decode()
+        self.assertIn("tool exited with a nonzero exit status",telemetry)
+        self.assertIn("tool telemetry",telemetry)
+        self.assertIn("call-1, call-1-detail",telemetry)
+        self.assertIn("occurrences 2",telemetry)
+        self.assertNotIn("tool exited with a nonzero exit status",panel)
+        denied=self.call("POST",f"/admin/requests/{pending['request_id']}/deny",{"Cookie":cookie,"Origin":"https://control.example","X-CSRF-Token":csrf},pending["approval_challenge"])
+        self.assertEqual("denied",denied.json()["state"])
+        denials=self.call("GET","/?feed=denials",{"Cookie":cookie}).body.decode()
+        self.assertIn("Policy denials (1)",denials)
+        self.assertIn("denied by a human decision",denials)
+        self.assertIn("policy gate",denials)
+        self.assertNotIn("tool exited",denials)
+        self.assertEqual(400,self.call("GET","/?feed=../etc",{"Cookie":cookie}).status)
 
     def test_http_json_rejects_non_finite_values(self):
         response=self.app.handle("POST","/api/v1/requests",self.agent,b'{"action":"device.power_off","parameters":{"x":NaN},"context":{},"idempotency_key":"nan"}')

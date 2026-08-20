@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "enabled": true,
+  "global_simulation_rule": {
+    "rule_id": "rule-global-simulation",
+    "version": 1,
+    "prohibited_classes": [
+      "arbitrary_command",
+      "credentials",
+      "destructive_git",
+      "external_communication",
+      "spending",
+      "undeclared_infrastructure"
+    ],
+    "requesters": ["example-agent"],
+    "nodes": ["example-node"],
+    "expires_at": 4102444800,
+    "review_by": 4102358400
+  },
+  "rules": [
+    {
+      "rule_id": "rule-example-code-work",
+      "version": 1,
+      "action_class": "code_edit",
+      "actions": ["code.edit_file"],
+      "repository": "example-org/example-service",
+      "refs": ["refs/heads/main"],
+      "requesters": ["example-agent"],
+      "nodes": ["example-node"],
+      "environments": [],
+      "targets": [],
+      "parameter_constraints": {"summary": {"enum": ["Apply reviewed patch"]}},
+      "expires_at": 4102444800,
+      "review_by": 4102358400
+    }
+  ]
+}

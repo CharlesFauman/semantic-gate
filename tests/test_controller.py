@@ -6,7 +6,51 @@ import unittest
 from pathlib import Path
 
 from semantic_gate.controller import GateControl, GateControlError, GateDecisionConflict
+from semantic_gate.projection import collapse_observations
 from semantic_gate.storage import Ledger
+
+
+class AutoApprovingBackend:
+    """Backend fake exposing the policy-owned auto-approval contract."""
+
+    def __init__(self, matched=True):
+        self.matched = matched
+        self.requests = {}
+        self.seen = []
+
+    def request_action(self, *, action, parameters, context, trusted_context, requester, idempotency_key, minimum_control="policy"):
+        request = {"request_id": "req_auto", "request_hash": "a" * 64, "action": action, "requester": requester,
+                   "state": "waiting_for_approval", "created_at": 100, "parameters": parameters, "context": context,
+                   "minimum_control": minimum_control, "policy_control": "ask", "effective_control": "ask",
+                   "gates": [{"id": "approval", "kind": "approval", "status": "waiting", "evidence": {"ttl_seconds": 300}}]}
+        request["approval_challenge"] = {"request_id": "req_auto", "request_hash": "a" * 64,
+                                         "approval_gate_id": "approval", "expires_at": 400}
+        self.requests["req_auto"] = request
+        return dict(request)
+
+    def approval_challenge(self, request_id):
+        return dict(self.requests[request_id]["approval_challenge"])
+
+    def get_request(self, request_id, requester=None):
+        return dict(self.requests[request_id])
+
+    def auto_approval_decision(self, request, *, paused=False, disabled_rules=()):
+        self.seen.append((paused, tuple(disabled_rules)))
+        if not self.matched:
+            return {"matched": False, "reason_code": "prohibited_class_requires_human",
+                    "reason": "The action falls inside the prohibited safety floor. (class: spending)"}
+        return {"matched": True, "reason_code": "matched_global_simulation_scope",
+                "reason": "Matched the standing simulation-only rule; nothing is executed.",
+                "rule_id": "rule-global-simulation", "rule_version": 1,
+                "evidence_binding": {"rule_id": "rule-global-simulation"}}
+
+    def auto_approve(self, request_id, decision):
+        self.requests[request_id]["state"] = "simulated"
+        audit = {"auto_approved": True, "rule_id": "rule-global-simulation", "rule_version": 1,
+                 "policy_version": 7, "request_id": request_id, "request_hash": "a" * 64,
+                 "commit": None, "action_class": "global_simulation",
+                 "reason_code": "matched_global_simulation_scope", "authorizes_execution": False}
+        return dict(self.requests[request_id]), {"evidence_id": "auto_1", "authorizes_execution": False}, audit
 
 
 class FakeBackend:
@@ -137,6 +181,75 @@ class GateControlTests(unittest.TestCase):
             self.control.observe(principal="hermes-mac",payload={**payload,"event_id":"call-3","metadata":{"raw":"rm -rf /"}})
         with self.assertRaisesRegex(GateControlError,"operation is invalid"):
             self.control.observe(principal="hermes-mac",payload={**payload,"event_id":"call-4","operation":"rm -rf /"})
+
+
+class AutoApprovalOrchestrationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ledger = Ledger(Path(self.tmp.name) / "ledger.sqlite3")
+
+    def tearDown(self):
+        self.ledger.close(); self.tmp.cleanup()
+
+    def control_for(self, backend):
+        return GateControl(backend, self.ledger, clock=lambda: 100)
+
+    def propose(self, control, action="code.edit_file"):
+        return control.request_action(principal="agent-code-1", host_context={"surface": "http", "node": "node-example-1"},
+                                      payload={"action": action, "parameters": {"summary": "Simulate"}, "context": {},
+                                               "idempotency_key": "auto-one"})
+
+    def test_matched_requests_are_auto_approved_and_immutably_audited(self):
+        backend = AutoApprovingBackend()
+        request = self.propose(self.control_for(backend))
+        self.assertEqual("simulated", request["state"])
+        self.assertTrue(request["auto_approval"]["matched"])
+        self.assertEqual("rule-global-simulation", request["auto_approval"]["rule_id"])
+        self.assertIs(False, request["auto_approval"]["authorizes_execution"])
+        events = self.ledger.audit_events()
+        self.assertEqual(["requested", "auto_approved"], [event["event"] for event in events])
+        self.assertEqual("a" * 64, events[-1]["metadata"]["request_hash"])
+        self.assertEqual(1, events[-1]["metadata"]["rule_version"])
+        self.assertIs(False, events[-1]["metadata"]["authorizes_execution"])
+        self.assertEqual("simulated", self.ledger.get_request("req_auto")["state"])
+
+    def test_unmatched_requests_keep_the_human_gate_with_a_safe_dry_run_reason(self):
+        backend = AutoApprovingBackend(matched=False)
+        request = self.propose(self.control_for(backend))
+        self.assertEqual("waiting_for_approval", request["state"])
+        self.assertFalse(request["auto_approval"]["matched"])
+        self.assertEqual("prohibited_class_requires_human", request["auto_approval"]["reason_code"])
+        self.assertIn("spending", request["auto_approval"]["reason"])
+        self.assertEqual(["requested"], [event["event"] for event in self.ledger.audit_events()])
+
+    def test_human_pause_and_rule_disable_controls_reach_the_matcher(self):
+        backend = AutoApprovingBackend()
+        control = self.control_for(backend)
+        self.ledger.set_control("auto_approval_paused", True, actor="control", now=100)
+        self.ledger.set_control("disabled_auto_rules", ["rule-global-simulation"], actor="control", now=100)
+        self.propose(control)
+        self.assertEqual((True, ("rule-global-simulation",)), backend.seen[-1])
+        self.assertIs(True, self.ledger.controls()["auto_approval_paused"])
+        self.assertEqual(["rule-global-simulation"], self.ledger.controls()["disabled_auto_rules"])
+
+    def test_correlated_root_and_detail_observations_are_stored_and_collapse_to_one_row(self):
+        control = self.control_for(AutoApprovingBackend())
+        payload = {"event_id": "call-1", "correlation_id": "corr-1", "phase": "completed",
+                   "operation": "code.edit_file", "semantic_class": "code.change.write", "outcome": "failed",
+                   "occurred_at": 99, "metadata": {"surface": "harness", "error_type": "nonzero_exit"}}
+        control.observe(principal="agent-code-1", payload=payload)
+        control.observe(principal="agent-code-1", payload={**payload, "event_id": "call-1-detail", "occurred_at": 100})
+        rows = self.ledger.recent_observations(limit=10)
+        self.assertEqual(2, len(rows))
+        self.assertEqual({"corr-1"}, {row["correlation_id"] for row in rows})
+        collapsed = collapse_observations(rows)
+        self.assertEqual(1, len(collapsed))
+        self.assertEqual(2, collapsed[0]["occurrences"])
+        self.assertFalse(collapsed[0]["is_gate_failure"])
+        with self.assertRaisesRegex(GateControlError, "correlation_id"):
+            control.observe(principal="agent-code-1", payload={**payload, "event_id": "call-2", "correlation_id": "bad id!"})
+        control.observe(principal="agent-code-1", payload={key: value for key, value in payload.items() if key != "correlation_id"} | {"event_id": "call-3"})
+        self.assertIsNone(collapse_observations(self.ledger.recent_observations(limit=10))[-1]["correlation_id"])
 
 
 if __name__ == "__main__":
