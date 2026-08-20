@@ -4,13 +4,9 @@
   "global_simulation_rule": {
     "rule_id": "rule-global-simulation",
     "version": 1,
-    "prohibited_classes": [
-      "arbitrary_command",
-      "credentials",
-      "destructive_git",
-      "external_communication",
-      "spending",
-      "undeclared_infrastructure"
+    "human_gate_classes": [
+      "human_communication",
+      "human_spending"
     ],
     "requesters": ["example-agent"],
     "nodes": ["example-node"],

@@ -10,14 +10,30 @@ from semantic_gate.coordinator import CoreBackend
 from semantic_gate.engine import ApprovalRejected
 
 
+CATALOG = {"version":1,"actions":{
+    "home.tv.power_off":{"domain":"home","risk":"R2","effect":"external_write","summary":"Turn off TV","approval":"separate_confirmation","gate_class":"automatic","privacy_classes":[],"constraints":[]},
+    "home.read":{"domain":"home","risk":"R0","effect":"read","summary":"Read","approval":"none","gate_class":"automatic","privacy_classes":[],"constraints":[]},
+    "communication.send":{"domain":"communication","risk":"R2","effect":"external_write","summary":"Send a message to a person","approval":"separate_confirmation","gate_class":"human_communication","privacy_classes":[],"constraints":[]},
+    "system.shell.execute":{"domain":"system","risk":"R4","effect":"prohibited","summary":"Shell","approval":"prohibited","gate_class":"prohibited","privacy_classes":[],"constraints":[]},
+}}
+PRINCIPALS = {"agent":{"role":"agent","enabled":True},"control":{"role":"admin","enabled":True}}
+
+
+def unique_delivered(at=100):
+    """Delivered notifier safe for several requests on one backend."""
+    class Delivered:
+        def notify(self, request, gate):
+            return {"delivered": True, "notification_id": "notice_" + request["request_hash"][:16],
+                    "request_id": request["request_id"], "request_hash": request["request_hash"],
+                    "notification_gate_id": gate["id"], "recipient": gate["recipient"],
+                    "template_hash": hashlib.sha256(gate["template"].encode()).hexdigest(), "delivered_at": at}
+    return Delivered()
+
+
 class CoreBackendTests(unittest.TestCase):
     def setUp(self):
-        self.catalog = {"version":1,"actions":{
-            "home.tv.power_off":{"domain":"home","risk":"R2","effect":"external_write","summary":"Turn off TV","approval":"separate_confirmation","privacy_classes":[],"constraints":[]},
-            "home.read":{"domain":"home","risk":"R0","effect":"read","summary":"Read","approval":"none","privacy_classes":[],"constraints":[]},
-            "system.shell.execute":{"domain":"system","risk":"R4","effect":"prohibited","summary":"Shell","approval":"prohibited","privacy_classes":[],"constraints":[]},
-        }}
-        self.principals = {"agent":{"role":"agent","enabled":True},"control":{"role":"admin","enabled":True}}
+        self.catalog = CATALOG
+        self.principals = PRINCIPALS
 
     @staticmethod
     def delivered(at=100):
@@ -175,11 +191,131 @@ class CoreBackendTests(unittest.TestCase):
         plain=CoreBackend(self.code_work_policy(),approval_key=bytes.fromhex("22"*32),clock=lambda:100,notifier=self.delivered())
         self.assertIsNone(plain.auto_approval_decision(self.code_request(plain,idempotency_key="no-policy")))
 
-    def test_read_and_prohibited_catalog_entries_are_not_requestable(self):
-        backend = CoreBackend(build_policy(self.catalog, self.principals), approval_key=bytes.fromhex("22" * 32), clock=lambda: 100)
-        for action in ("home.read", "system.shell.execute"):
-            with self.subTest(action=action), self.assertRaises(Exception):
-                backend.request_action(action=action, parameters={}, context={}, trusted_context={}, requester="agent", idempotency_key=action)
+    def test_prohibited_catalog_entries_are_unrequestable_while_reads_are_gated(self):
+        backend = CoreBackend(build_policy(self.catalog, self.principals), approval_key=bytes.fromhex("22" * 32), clock=lambda: 100, notifier=self.delivered())
+        with self.assertRaises(Exception):
+            backend.request_action(action="system.shell.execute", parameters={}, context={}, trusted_context={}, requester="agent", idempotency_key="shell")
+        read = backend.request_action(action="home.read", parameters={"summary":"Read","target":"home","details":{}}, context={}, trusted_context={}, requester="agent", idempotency_key="read")
+        self.assertEqual("waiting_for_approval", read["state"])
+
+
+class CoreBackendCatalogueWiringTests(unittest.TestCase):
+    """CoreBackend owns and passes the authoritative catalogue and the live policy
+    execution_enabled flag into every auto-approval evaluation."""
+
+    def setUp(self):
+        self.catalog = CATALOG
+        self.principals = PRINCIPALS
+
+    def standing_document(self, now=100):
+        return {"version":5,"enabled":True,"rules":[],"global_simulation_rule":{
+            "rule_id":"rule-global-simulation","version":1,
+            "human_gate_classes":["human_communication","human_spending"],
+            "requesters":["agent"],"nodes":["node-example-1"],
+            "expires_at":now+86_400,"review_by":now+3_600}}
+
+    def backend(self, policy=None, **kwargs):
+        options = {"approval_key": bytes.fromhex("22"*32), "clock": lambda: 100, "notifier": unique_delivered(),
+                   "auto_approval": AutoApprovalPolicy(self.standing_document()), "catalog": self.catalog}
+        options.update(kwargs)
+        return CoreBackend(policy if policy is not None else build_policy(self.catalog, self.principals), **options)
+
+    def propose(self, backend, action="home.tv.power_off", key="wired-one"):
+        return backend.request_action(action=action, parameters={"summary":"Simulate","target":"living-room-tv","details":{}},
+                                      context={}, trusted_context={"node":"node-example-1","surface":"http"},
+                                      requester="agent", idempotency_key=key)
+
+    def test_backend_passes_its_authoritative_catalogue_to_the_standing_rule(self):
+        backend = self.backend()
+        self.assertIs(False, backend.execution_enabled)
+        decision = backend.auto_approval_decision(self.propose(backend))
+        self.assertTrue(decision["matched"], decision["reason"])
+        self.assertEqual("matched_global_simulation_scope", decision["reason_code"])
+        gated = backend.auto_approval_decision(self.propose(backend, action="communication.send", key="wired-comm"))
+        self.assertFalse(gated["matched"])
+        self.assertEqual("communication_requires_human", gated["reason_code"])
+
+    def test_live_execution_enabled_policy_blocks_the_standing_rule(self):
+        enforcing = {**build_policy(self.catalog, self.principals), "mode": "enforcing", "execution_enabled": True}
+        backend = self.backend(policy=enforcing)
+        self.assertIs(True, backend.execution_enabled)
+        decision = backend.auto_approval_decision(self.propose(backend))
+        self.assertFalse(decision["matched"])
+        self.assertEqual("global_rule_requires_simulation_only", decision["reason_code"])
+        with self.assertRaises(ApprovalRejected):
+            backend.auto_approve(self.propose(backend)["request_id"], {"matched": True, "evidence_binding": {}})
+
+    def test_standing_rule_requires_the_catalogue_and_a_valid_one_at_construction(self):
+        with self.assertRaisesRegex(ValueError, "catalogue"):
+            self.backend(catalog=None)
+        broken = {"version":1,"actions":{**self.catalog["actions"],"broken.action":{"risk":"R1","effect":"read","approval":"none"}}}
+        with self.assertRaises(ValueError):
+            self.backend(catalog=broken)
+
+
+class CoreBackendStateCleanupTests(unittest.TestCase):
+    """Challenge and trusted-node bindings are purged on every terminal transition."""
+
+    def setUp(self):
+        self.catalog = CATALOG
+        self.principals = PRINCIPALS
+        self.now = [100]
+
+    def backend(self, notifier=None, **kwargs):
+        return CoreBackend(build_policy(self.catalog, self.principals), approval_key=bytes.fromhex("22"*32),
+                           clock=lambda: self.now[0], notifier=notifier or unique_delivered(), **kwargs)
+
+    def propose(self, backend, key):
+        return backend.request_action(action="home.tv.power_off", parameters={"summary":"Simulate","target":"tv","details":{}},
+                                      context={}, trusted_context={"node":"node-example-1"}, requester="agent", idempotency_key=key)
+
+    def assert_clean(self, backend, request_id):
+        self.assertIsNone(backend.approval_challenge(request_id))
+        self.assertNotIn(request_id, backend._decision_challenges)
+        self.assertNotIn(request_id, backend._trusted_nodes)
+
+    def test_human_approval_denial_and_cancellation_purge_binding_state(self):
+        backend = self.backend()
+        approved = self.propose(backend, "clean-approve")
+        backend.approve_request(approved["request_id"], actor="control", challenge=approved["approval_challenge"])
+        self.assert_clean(backend, approved["request_id"])
+        denied = self.propose(backend, "clean-deny")
+        backend.deny_request(denied["request_id"], actor="control", challenge=denied["approval_challenge"])
+        self.assert_clean(backend, denied["request_id"])
+        cancelled = self.propose(backend, "clean-cancel")
+        backend.cancel_request(cancelled["request_id"], requester="agent")
+        self.assert_clean(backend, cancelled["request_id"])
+
+    def test_auto_approval_purges_binding_state(self):
+        standing = {"version":5,"enabled":True,"rules":[],"global_simulation_rule":{
+            "rule_id":"rule-global-simulation","version":1,
+            "human_gate_classes":["human_communication","human_spending"],
+            "requesters":["agent"],"nodes":["node-example-1"],
+            "expires_at":86_500,"review_by":3_700}}
+        backend = self.backend(auto_approval=AutoApprovalPolicy(standing), catalog=self.catalog)
+        request = self.propose(backend, "clean-auto")
+        decision = backend.auto_approval_decision(request)
+        decided, _evidence, _audit = backend.auto_approve(request["request_id"], decision)
+        self.assertEqual("simulated", decided["state"])
+        self.assert_clean(backend, request["request_id"])
+
+    def test_terminal_and_expired_observations_purge_binding_state(self):
+        class Misbound:
+            def notify(self, request, gate):
+                return {"delivered": True, "notification_id": "", "request_id": request["request_id"],
+                        "request_hash": request["request_hash"], "notification_gate_id": gate["id"],
+                        "recipient": gate["recipient"], "template_hash": "0"*64, "delivered_at": 100}
+        blocked_backend = self.backend(notifier=Misbound())
+        blocked = self.propose(blocked_backend, "clean-blocked")
+        self.assertEqual("blocked", blocked["state"])
+        self.assert_clean(blocked_backend, blocked["request_id"])
+        backend = self.backend()
+        waiting = self.propose(backend, "clean-expired")
+        self.assertIsNotNone(backend.approval_challenge(waiting["request_id"]))
+        self.now[0] = waiting["approval_challenge"]["expires_at"] + 1
+        observed = backend.get_request(waiting["request_id"])
+        self.assertEqual("waiting_for_approval", observed["state"])
+        self.assert_clean(backend, waiting["request_id"])
 
 
 if __name__ == "__main__":

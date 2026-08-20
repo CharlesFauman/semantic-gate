@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Policy-owned, default-deny auto-approval for typed safe code-work actions.
+"""Policy-owned, default-deny auto-approval over one exact request.
 
-The matcher is a pure deterministic function over one exact request. It can only
-approve a request whose exact semantic action is a declared member of a typed safe
-class inside a checked-in rule that also pins the canonical repository identity,
-allowed refs, declared deploy target/environment, host-authenticated requester and
-node, closed parameter constraints, commit identity and an unexpired review window.
+The matcher is a pure deterministic function. Scoped rules approve typed safe
+code-work actions inside a pinned repository/ref/requester/node scope. The
+standing simulation-only rule approves every catalogued non-prohibited action
+EXCEPT the two human gate classes the catalogue metadata declares:
+``human_communication`` (communication/sending/disclosure to a person or
+external recipient) and ``human_spending`` (spending/transferring/purchasing/
+committing money). Classification comes solely from the required ``gate_class``
+catalogue metadata; action-name tokens and caller parameters never reclassify an
+action. Caller parameters can only fail a request toward the human gate (secret,
+command and destructive-parameter screening), never away from it.
 
 Everything else keeps the ordinary human gate. Auto-approval is approval evidence
 for one request only; it never authorizes execution, never widens policy and is not
@@ -19,6 +24,8 @@ import os
 import re
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
+
+from .catalog import HUMAN_GATE_CLASSES, action_gate_class
 
 # Typed safe code-work classes. A rule may only declare members of one class.
 SAFE_ACTION_CLASSES: Mapping[str, tuple[str, ...]] = MappingProxyType({
@@ -40,36 +47,11 @@ RULE_FIELDS = frozenset({
 })
 CORE_PARAMETERS = frozenset({"repository", "ref", "commit", "environment", "target"})
 
-# Hard stop: arbitrary command execution is never auto-approvable, whatever a rule says.
-FORBIDDEN_ACTION_TOKENS = (
-    "terminal", "shell", "command", "commands", "cmd", "exec", "execute", "eval",
-    "script", "sudo", "powershell", "bash", "zsh",
-)
-
-# The explicit safety floor. A checked-in document must declare it in full and cannot
-# shrink it. These classes keep the ordinary human gate even under a standing rule, and
-# they are the classes that must stay human when execution is later enabled.
-PROHIBITED_CLASSES: Mapping[str, tuple[str, ...]] = MappingProxyType({
-    "credentials": ("secret", "secrets", "credential", "credentials", "password", "passwords",
-                    "token", "tokens", "apikey", "keyring", "vault", "rotate", "unseal"),
-    "spending": ("purchase", "purchases", "payment", "pay", "order", "orders", "invoice",
-                 "billing", "checkout", "transfer", "refund", "subscribe", "spend"),
-    "external_communication": ("communication", "communications", "email", "mail", "message",
-                               "messages", "sms", "call", "notify", "publish", "post", "broadcast",
-                               "share", "tweet", "send"),
-    "destructive_git": ("force", "rewrite", "amend", "delete", "destroy", "purge", "prune",
-                        "reset", "squash", "rebase", "drop"),
-    "undeclared_infrastructure": ("infra", "infrastructure", "deploy", "release", "rollout",
-                                  "provision", "terraform", "firewall", "iam", "dns", "cluster",
-                                  "scale", "restart", "migrate", "network"),
-    "arbitrary_command": FORBIDDEN_ACTION_TOKENS,
-})
+# The standing rule must declare the closed human gate classes in full: it can
+# neither shrink nor extend the catalogue-owned classification vocabulary.
 GLOBAL_RULE_FIELDS = frozenset({
-    "rule_id", "version", "prohibited_classes", "requesters", "nodes", "expires_at", "review_by",
+    "rule_id", "version", "human_gate_classes", "requesters", "nodes", "expires_at", "review_by",
 })
-# Classes a scoped rule may never declare. Undeclared infrastructure is excluded because a
-# scoped deploy rule is exactly how an infrastructure effect becomes declared.
-SCOPED_RULE_FORBIDDEN_CLASSES = frozenset(set(PROHIBITED_CLASSES) - {"undeclared_infrastructure"})
 COMMAND_FIELDS = frozenset({"command", "commands", "cmd", "argv", "args", "script", "shell", "entrypoint"})
 SECRET_FIELDS = frozenset({"secret", "secrets", "token", "api_key", "apikey", "password", "credential",
                            "credentials", "private_key", "authorization", "auth", "cookie", "session"})
@@ -95,12 +77,11 @@ REASON_CODES: Mapping[str, str] = MappingProxyType({
     "request_not_waiting": "The request is not waiting for an approval decision.",
     "challenge_unavailable": "No exact unexpired approval challenge is available for this request.",
     "step_up_requires_independent_transport": "Step-up assurance needs an independently authenticated human transport.",
-    "action_class_forbidden": "This action is never auto-approvable, whatever a rule declares.",
     "matched_global_simulation_scope": "Matched the standing simulation-only rule; nothing is executed.",
     "global_rule_requires_simulation_only": "The standing rule only applies while execution is disabled.",
     "action_not_catalogued": "The action is not a member of the checked-in action catalogue.",
     "action_prohibited_by_catalogue": "The action catalogue marks this action prohibited.",
-    "prohibited_class_requires_human": "The action falls inside the prohibited safety floor.",
+    "gate_class_undeclared": "The catalogue entry does not declare a valid gate class.",
     "no_standing_rule": "No standing simulation-only rule is declared.",
     "action_not_recognized": "The semantic action is not a recognizable typed action identifier.",
     "no_rule_for_action": "No declared rule lists this exact semantic action.",
@@ -120,8 +101,8 @@ REASON_CODES: Mapping[str, str] = MappingProxyType({
     "commit_changed_since_match": "The commit changed after the rule matched, so the evidence is void.",
     "command_parameter_forbidden": "Terminal, shell and arbitrary command parameters are never auto-approved.",
     "parameter_looks_like_secret": "A parameter looks like a credential or secret material.",
-    "spending_requires_human": "Spending parameters always require a human decision.",
-    "communication_requires_human": "External communication parameters always require a human decision.",
+    "spending_requires_human": "Spending, transferring, purchasing or committing money always requires a human decision.",
+    "communication_requires_human": "Communication, sending or disclosure to a person or external recipient always requires a human decision.",
     "path_parameter_unsafe": "A filesystem path parameter is absolute, traversing, non-canonical or uncontained.",
     "parameter_not_constrained": "A parameter is not covered by the closed constraints of the rule.",
     "parameter_value_not_allowed": "A parameter value is outside the closed values the rule declares.",
@@ -131,23 +112,6 @@ REASON_CODES: Mapping[str, str] = MappingProxyType({
 
 class AutoApprovalPolicyError(ValueError):
     """A checked-in auto-approval document is malformed, wildcarded or unsafe."""
-
-
-def _action_tokens(action: str) -> list[str]:
-    return re.split(r"[._-]", action.casefold())
-
-
-def _forbidden_action(action: str) -> bool:
-    return any(token in FORBIDDEN_ACTION_TOKENS for token in _action_tokens(action))
-
-
-def prohibited_class(action: str) -> str | None:
-    """Return the safety-floor class this action belongs to, or None."""
-    tokens = set(_action_tokens(action))
-    for name in sorted(PROHIBITED_CLASSES):
-        if tokens & set(PROHIBITED_CLASSES[name]):
-            return name
-    return None
 
 
 def _exact_strings(value: Any, *, field: str, rule_id: str, pattern: re.Pattern[str], allow_empty: bool) -> tuple[str, ...]:
@@ -176,11 +140,6 @@ def _validated_rule(raw: Any) -> Mapping[str, Any]:
     actions = _exact_strings(raw["actions"], field="actions", rule_id=rule_id, pattern=_ACTION, allow_empty=False)
     members = SAFE_ACTION_CLASSES[action_class]
     for action in actions:
-        if _forbidden_action(action):
-            raise AutoApprovalPolicyError(f"rule {rule_id} declares a never-auto-approvable action")
-        declared_class = prohibited_class(action)
-        if declared_class in SCOPED_RULE_FORBIDDEN_CLASSES:
-            raise AutoApprovalPolicyError(f"rule {rule_id} declares an action inside the {declared_class} safety floor")
         if action not in members:
             raise AutoApprovalPolicyError(f"rule {rule_id} declares an action outside class {action_class}")
     repository = raw["repository"]
@@ -231,14 +190,14 @@ def _validated_global_rule(raw: Any) -> Mapping[str, Any]:
     for field in ("version", "expires_at", "review_by"):
         if type(raw[field]) is not int or raw[field] < 0:
             raise AutoApprovalPolicyError(f"standing rule field {field} must be a non-negative integer")
-    declared = raw["prohibited_classes"]
-    if not isinstance(declared, list) or set(declared) != set(PROHIBITED_CLASSES):
-        raise AutoApprovalPolicyError(f"standing rule must declare the whole safety floor {sorted(PROHIBITED_CLASSES)}")
+    declared = raw["human_gate_classes"]
+    if not isinstance(declared, list) or set(declared) != set(HUMAN_GATE_CLASSES) or len(declared) != len(set(declared)):
+        raise AutoApprovalPolicyError(f"standing rule must declare the whole human gate exactly: {sorted(HUMAN_GATE_CLASSES)}")
     requesters = _exact_strings(raw["requesters"], field="requesters", rule_id=rule_id, pattern=_IDENTITY, allow_empty=False)
     nodes = _exact_strings(raw["nodes"], field="nodes", rule_id=rule_id, pattern=_IDENTITY, allow_empty=False)
     return MappingProxyType({
         "rule_id": rule_id, "version": raw["version"], "action_class": "global_simulation",
-        "prohibited_classes": tuple(sorted(declared)), "requesters": requesters, "nodes": nodes,
+        "human_gate_classes": tuple(sorted(declared)), "requesters": requesters, "nodes": nodes,
         "expires_at": raw["expires_at"], "review_by": raw["review_by"],
     })
 
@@ -376,24 +335,41 @@ def _parameter_failure(rule: Mapping[str, Any], parameters: Mapping[str, Any], p
     return None
 
 
-def _sensitive_parameter_failure(parameters: Any, *, depth: int = 0) -> tuple[str, str] | None:
-    """Scan bounded nested parameters for safety-floor fields only."""
-    if depth > 3 or not isinstance(parameters, Mapping):
+# The request domain bounds JSON nesting (engine MAX_JSON_DEPTH); screening must
+# reach every level the domain can accept and fail closed beyond it, never skip.
+_SCREEN_DEPTH_LIMIT = 64
+
+
+def _sensitive_parameter_failure(parameters: Any, *, depth: int = 0) -> tuple[str, str | None] | None:
+    """Recursively screen nested parameters (mappings and sequences) for safety-floor fields."""
+    if depth > _SCREEN_DEPTH_LIMIT:
+        return "parameter_not_constrained", None
+    if isinstance(parameters, str):
+        return ("parameter_looks_like_secret", None) if _SECRET_VALUE.search(parameters) else None
+    if isinstance(parameters, Mapping):
+        for field in sorted(parameters, key=str):
+            if not isinstance(field, str):
+                return "parameter_not_constrained", None
+            value = parameters[field]
+            sensitive = _sensitive_field(field)
+            if sensitive is not None:
+                return sensitive, field
+            if field.casefold() in DESTRUCTIVE_FIELDS and value is not False:
+                return "destructive_git_requires_human", field
+            if isinstance(value, str):
+                if _SECRET_VALUE.search(value):
+                    return "parameter_looks_like_secret", field
+                continue
+            nested = _sensitive_parameter_failure(value, depth=depth + 1)
+            if nested is not None:
+                return nested
         return None
-    for field in sorted(parameters, key=str):
-        if not isinstance(field, str):
-            return "parameter_not_constrained", None
-        value = parameters[field]
-        sensitive = _sensitive_field(field)
-        if sensitive is not None:
-            return sensitive, field
-        if isinstance(value, str) and _SECRET_VALUE.search(value):
-            return "parameter_looks_like_secret", field
-        if field.casefold() in DESTRUCTIVE_FIELDS and value is not False:
-            return "destructive_git_requires_human", field
-        nested = _sensitive_parameter_failure(value, depth=depth + 1)
-        if nested is not None:
-            return nested
+    if isinstance(parameters, (list, tuple)):
+        for value in parameters:
+            nested = _sensitive_parameter_failure(value, depth=depth + 1)
+            if nested is not None:
+                return nested
+        return None
     return None
 
 
@@ -416,11 +392,15 @@ def _global_rule_failure(rule: Mapping[str, Any], request: Mapping[str, Any], *,
     entry = actions.get(action) if isinstance(actions, Mapping) else None
     if not isinstance(entry, Mapping):
         return "action_not_catalogued", None
-    if entry.get("effect") == "prohibited" or entry.get("approval") == "prohibited":
+    declared = action_gate_class(entry)
+    if declared == "prohibited" or entry.get("effect") == "prohibited" or entry.get("approval") == "prohibited":
         return "action_prohibited_by_catalogue", None
-    floor = prohibited_class(action)
-    if floor is not None:
-        return "prohibited_class_requires_human", ("class", floor)
+    if declared is None:
+        return "gate_class_undeclared", None
+    if declared == "human_communication":
+        return "communication_requires_human", ("class", declared)
+    if declared == "human_spending":
+        return "spending_requires_human", ("class", declared)
     return _sensitive_parameter_failure(request.get("parameters"))
 
 
@@ -499,8 +479,6 @@ def evaluate(request: Any, *, policy: AutoApprovalPolicy, now: int, node: str | 
     action = request.get("action")
     if not isinstance(action, str) or not _ACTION.fullmatch(action):
         return _decision("action_not_recognized")
-    if _forbidden_action(action):
-        return _decision("action_class_forbidden")
     candidates = [rule for rule in policy.rules if action in rule["actions"]]
     first_failure = None
     for rule in candidates:

@@ -9,7 +9,8 @@ from urllib.parse import urlencode
 from pathlib import Path
 
 from semantic_gate.auth import CapabilityAuthority
-from semantic_gate.autoapproval import PROHIBITED_CLASSES, AutoApprovalPolicy
+from semantic_gate.autoapproval import AutoApprovalPolicy
+from semantic_gate.catalog import HUMAN_GATE_CLASSES
 from semantic_gate.controller import GateControl
 from semantic_gate.credentials import CredentialRegistry
 from semantic_gate.server import PANEL_COLORS, PANEL_CONTRAST_PAIRS, SemanticGateApplication
@@ -332,19 +333,20 @@ class SemanticGateApplicationTests(unittest.TestCase):
 
     def standing_policy(self):
         return AutoApprovalPolicy({"version":7,"enabled":True,"rules":[],"global_simulation_rule":{
-            "rule_id":"rule-global-simulation","version":1,"prohibited_classes":sorted(PROHIBITED_CLASSES),
+            "rule_id":"rule-global-simulation","version":1,"human_gate_classes":sorted(HUMAN_GATE_CLASSES),
             "requesters":["agent"],"nodes":["node-example-1"],"expires_at":90_000,"review_by":80_000}})
 
-    def test_panel_shows_the_global_standing_rule_simulation_stop_and_prohibited_floor(self):
-        self.app.auto_approval=self.standing_policy()
+    def test_panel_shows_the_standing_rule_both_exclusions_and_emergency_pause(self):
+        self.control.backend.auto_approval=self.standing_policy()
         login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
         cookie=login.headers["Set-Cookie"].split(";",1)[0]
         panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
-        for expected in ("GLOBAL AUTO-APPROVE","simulation only","execution_enabled=false","Auto-approval rules",
-                         "rule-global-simulation","version 1","Enabled","Next review","Expires",
-                         "Always asks a human","Pause auto-approval",
-                         "credentials","spending","external_communication","destructive_git",
-                         "undeclared_infrastructure","arbitrary_command"):
+        for expected in ("Automatic except communications and spending","simulation only","execution_enabled=false",
+                         "Auto-approval rules","rule-global-simulation","version 1","Enabled","Next review","Expires",
+                         "Always asks a human","Pause auto-approval","Pause all",
+                         "human_communication","human_spending",
+                         "communication, sending or disclosure to a person or external recipient",
+                         "spending, transferring, purchasing or committing money"):
             with self.subTest(expected=expected): self.assertIn(expected,panel)
         self.assertNotIn("<script",panel)
         csrf=re.search(r"name='csrf_token' value='([^']+)'",panel).group(1)
@@ -359,8 +361,28 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.form("POST","/admin/controls",origin,{"csrf_token":csrf,"key":"auto_approval_paused","value":"false"})
         self.assertIs(False,self.ledger.controls()["auto_approval_paused"])
 
+    def test_panel_banner_derives_from_the_wired_backend_not_a_separate_document(self):
+        self.assertFalse(hasattr(self.app,"auto_approval"))
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        unconfigured=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertIn("No auto-approval policy is configured",unconfigured)
+        self.assertNotIn("Automatic except communications and spending",unconfigured)
+        self.control.backend.auto_approval=self.standing_policy()
+        wired=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertIn("Automatic except communications and spending",wired)
+        self.assertIs(False,self.call("GET","/health").json()["execution_enabled"])
+        self.assertIn("execution_enabled=false",wired)
+        self.assertIn("Execution is globally disabled",wired)
+        self.control.backend.execution_enabled=True
+        self.assertIs(True,self.call("GET","/health").json()["execution_enabled"])
+        enabled=self.call("GET","/",{"Cookie":cookie}).body.decode()
+        self.assertIn("execution_enabled=true",enabled)
+        self.assertNotIn("Execution is globally disabled",enabled)
+        self.assertIn("standing simulation-only rule does not apply",enabled)
+
     def test_agents_cannot_reach_any_auto_approval_rule_mutation_surface(self):
-        self.app.auto_approval=self.standing_policy()
+        self.control.backend.auto_approval=self.standing_policy()
         tools=[tool["name"] for tool in self.call("POST","/mcp",self.agent,{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).json()["result"]["tools"]]
         self.assertEqual(["list_actions","explain_action","request_action","get_request","cancel_request"],tools)
         for path in ("/api/v1/auto-approval-rules","/api/v1/auto-approval/pause","/admin/auto-approval-rules"):
@@ -371,16 +393,16 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertIs(False,self.ledger.controls()["auto_approval_paused"])
 
     def test_pending_card_explains_why_auto_approval_did_not_apply(self):
-        self.control.backend.auto_decision={"matched":False,"reason_code":"prohibited_class_requires_human",
-                                            "reason":"The action falls inside the prohibited safety floor. (class: spending)"}
+        self.control.backend.auto_decision={"matched":False,"reason_code":"spending_requires_human",
+                                            "reason":"Spending, transferring, purchasing or committing money always requires a human decision. (class: human_spending)"}
         login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
         cookie=login.headers["Set-Cookie"].split(";",1)[0]
         self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"dry run"})
         panel=self.call("GET","/",{"Cookie":cookie}).body.decode()
         card=panel[panel.index("Pending decisions (1)"):panel.index("<details class=request-review")]
         self.assertIn("Auto-approval did not apply",card)
-        self.assertIn("prohibited safety floor",card)
-        self.assertIn("spending",card)
+        self.assertIn("always requires a human decision",card)
+        self.assertIn("human_spending",card)
 
     def test_panel_separates_gate_decisions_policy_denials_and_execution_telemetry(self):
         login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})

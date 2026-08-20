@@ -6,7 +6,6 @@ import unittest
 
 from semantic_gate import autoapproval
 from semantic_gate.autoapproval import (
-    PROHIBITED_CLASSES,
     AutoApprovalPolicy,
     AutoApprovalPolicyError,
     approval_evidence,
@@ -14,6 +13,7 @@ from semantic_gate.autoapproval import (
     commit_binding_valid,
     evaluate,
 )
+from semantic_gate.catalog import HUMAN_GATE_CLASSES
 
 NOW = 1_700_000_000
 HASH = "9f" * 32
@@ -53,22 +53,27 @@ DOCUMENT = {"version": 7, "enabled": True, "rules": [CODE_RULE, PUSH_RULE, DEPLO
 
 GLOBAL_RULE = {
     "rule_id": "rule-global-simulation", "version": 1,
-    "prohibited_classes": sorted(PROHIBITED_CLASSES),
+    "human_gate_classes": sorted(HUMAN_GATE_CLASSES),
     "requesters": ["agent-code-1"], "nodes": ["node-example-1"],
     "expires_at": NOW + 86_400, "review_by": NOW + 3_600,
 }
 GLOBAL_DOCUMENT = {"version": 7, "enabled": True, "rules": [], "global_simulation_rule": GLOBAL_RULE}
+
+# The catalogue is the only classification authority. Names are deliberately
+# adversarial: harmless-looking code/deploy names carry human metadata, and
+# automatic entries carry name tokens that a token matcher would overexclude.
 CATALOGUE = {"actions": {
-    "home.display.power_off": {"risk": "R2", "effect": "external_write", "approval": "separate_confirmation"},
-    "code.edit_file": {"risk": "R1", "effect": "write", "approval": "separate_confirmation"},
-    "purchase.place_order": {"risk": "R3", "effect": "external_write", "approval": "separate_confirmation"},
-    "communication.send": {"risk": "R3", "effect": "external_write", "approval": "separate_confirmation"},
-    "system.shell.execute": {"risk": "R4", "effect": "prohibited", "approval": "prohibited"},
-    "deploy.release": {"risk": "R3", "effect": "external_write", "approval": "separate_confirmation"},
-    "credentials.rotate": {"risk": "R4", "effect": "external_write", "approval": "separate_confirmation"},
-    "infra.provision": {"risk": "R4", "effect": "external_write", "approval": "separate_confirmation"},
-    "git.push_force": {"risk": "R4", "effect": "external_write", "approval": "separate_confirmation"},
-    "home.reporting.summarize": {"risk": "R1", "effect": "external_write", "approval": "separate_confirmation"},
+    "home.display.power_off": {"risk": "R2", "effect": "external_write", "approval": "separate_confirmation", "gate_class": "automatic"},
+    "code.edit_file": {"risk": "R1", "effect": "write", "approval": "separate_confirmation", "gate_class": "automatic"},
+    "home.reporting.summarize": {"risk": "R1", "effect": "external_write", "approval": "separate_confirmation", "gate_class": "automatic"},
+    "deploy.internal.release": {"risk": "R2", "effect": "external_write", "approval": "separate_confirmation", "gate_class": "automatic"},
+    "finance.balance.read": {"risk": "R1", "effect": "read", "approval": "none", "gate_class": "automatic"},
+    "purchase.place_order": {"risk": "R3", "effect": "external_write", "approval": "separate_confirmation", "gate_class": "human_spending"},
+    "communication.send": {"risk": "R3", "effect": "external_write", "approval": "separate_confirmation", "gate_class": "human_communication"},
+    "code.sync_review": {"risk": "R2", "effect": "external_write", "approval": "separate_confirmation", "gate_class": "human_communication"},
+    "deploy.release_notes": {"risk": "R2", "effect": "external_write", "approval": "separate_confirmation", "gate_class": "human_spending"},
+    "system.shell.execute": {"risk": "R4", "effect": "prohibited", "approval": "prohibited", "gate_class": "prohibited"},
+    "legacy.unclassified.action": {"risk": "R1", "effect": "write", "approval": "separate_confirmation"},
 }}
 
 
@@ -179,12 +184,12 @@ class AutoApprovalMatcherTests(unittest.TestCase):
             approval_evidence(decision, request_snapshot())
 
     # --- adversarial rejections --------------------------------------------------------
-    def test_terminal_shell_and_arbitrary_command_actions_are_never_auto_approved(self):
+    def test_undeclared_actions_are_never_auto_approved_by_scoped_rules(self):
         for action in ("terminal.run", "shell.exec", "command.invoke", "code.edit_file.terminal", "git.push_force"):
             with self.subTest(action=action):
                 decision = self.decide(request_snapshot(action=action))
                 self.assertFalse(decision["matched"])
-                self.assertIn(decision["reason_code"], {"action_class_forbidden", "no_rule_for_action"})
+                self.assertEqual("no_rule_for_action", decision["reason_code"])
 
     def test_command_path_secret_spending_and_communication_parameters_fail_closed(self):
         cases = {
@@ -274,8 +279,7 @@ class AutoApprovalMatcherTests(unittest.TestCase):
         self.assertEqual("destructive_git_requires_human", self.decide(push)["reason_code"])
         for action in ("git.rewrite_history", "git.delete_repository", "git.reset_hard", "git.force_push"):
             with self.subTest(action=action):
-                self.assertIn(self.decide(request_snapshot(action=action))["reason_code"],
-                              {"action_class_forbidden", "no_rule_for_action"})
+                self.assertEqual("no_rule_for_action", self.decide(request_snapshot(action=action))["reason_code"])
 
     def test_disabled_paused_expired_stale_and_step_up_requests_are_not_auto_approved(self):
         self.assertEqual("auto_approval_paused", self.decide(paused=True)["reason_code"])
@@ -346,20 +350,21 @@ class AutoApprovalMatcherTests(unittest.TestCase):
         self.assertEqual([], mutators)
 
 
-class GlobalSimulationRuleTests(unittest.TestCase):
-    """The standing simulation-only rule covers catalogued actions above a fixed safety floor."""
+class GlobalStandingRuleTests(unittest.TestCase):
+    """The standing rule auto-approves every catalogued non-prohibited action for
+    simulation, except the two human gate classes declared by catalogue metadata."""
 
     def setUp(self):
         self.policy = AutoApprovalPolicy(GLOBAL_DOCUMENT)
 
-    def decide(self, action="home.display.powered_off", **kwargs):
+    def decide(self, action="home.display.power_off", **kwargs):
         options = {"policy": self.policy, "now": NOW, "policy_version": 7, "catalogue": CATALOGUE, "execution_enabled": False}
         options.update(kwargs)
         request = options.pop("request", None) or request_snapshot(
-            action=action, parameters={"summary": "Simulate the catalogued action", "target": "example-display", "details": {}})
+            action=action, parameters={"summary": "Simulate the catalogued action", "target": "example-target", "details": {}})
         return evaluate(request, **options)
 
-    def test_every_catalogued_action_above_the_safety_floor_is_auto_approved_for_simulation(self):
+    def test_every_catalogued_automatic_action_is_auto_approved_for_simulation(self):
         for action in ("home.display.power_off", "code.edit_file", "home.reporting.summarize"):
             with self.subTest(action=action):
                 decision = self.decide(action)
@@ -368,32 +373,59 @@ class GlobalSimulationRuleTests(unittest.TestCase):
                 self.assertEqual("rule-global-simulation", decision["rule_id"])
                 self.assertEqual("global_simulation", decision["action_class"])
                 self.assertIn("simulation", decision["reason"])
-                request = request_snapshot(action=action, parameters={"summary": "Simulate the catalogued action", "target": "example-display", "details": {}})
+                request = request_snapshot(action=action, parameters={"summary": "Simulate the catalogued action", "target": "example-target", "details": {}})
                 evidence = approval_evidence(decision, request)
                 self.assertIs(False, evidence["authorizes_execution"])
                 self.assertEqual("policy:auto-approval:rule-global-simulation", evidence["actor"])
                 self.assertEqual(HASH, evidence["request_hash"])
                 self.assertIs(False, audit_metadata(decision, request)["authorizes_execution"])
 
-    def test_the_prohibited_safety_floor_always_keeps_the_human_gate(self):
-        for action, prohibited_class in (
-            ("purchase.place_order", "spending"),
-            ("communication.send", "external_communication"),
-            ("credentials.rotate", "credentials"),
-            ("git.push_force", "destructive_git"),
-            ("infra.provision", "undeclared_infrastructure"),
-            ("deploy.release", "undeclared_infrastructure"),
+    def test_internal_deploy_and_read_only_balance_are_not_overexcluded(self):
+        # A token matcher would overexclude these names; metadata says automatic.
+        for action in ("deploy.internal.release", "finance.balance.read"):
+            with self.subTest(action=action):
+                decision = self.decide(action)
+                self.assertTrue(decision["matched"], decision["reason"])
+                self.assertEqual("matched_global_simulation_scope", decision["reason_code"])
+
+    def test_communication_and_spending_metadata_always_keep_the_human_gate(self):
+        for action, reason_code, declared in (
+            ("communication.send", "communication_requires_human", "human_communication"),
+            ("purchase.place_order", "spending_requires_human", "human_spending"),
         ):
             with self.subTest(action=action):
                 decision = self.decide(action)
                 self.assertFalse(decision["matched"])
-                self.assertEqual("prohibited_class_requires_human", decision["reason_code"])
-                self.assertIn(prohibited_class, decision["reason"])
+                self.assertEqual(reason_code, decision["reason_code"])
+                self.assertIn(declared, decision["reason"])
 
-    def test_catalogue_membership_prohibition_and_execution_mode_are_hard_stops(self):
-        self.assertEqual("action_class_forbidden", self.decide("system.shell.execute")["reason_code"])
+    def test_harmless_code_and_deploy_names_cannot_smuggle_send_or_payment_metadata(self):
+        # Classification is metadata-only: a benign-looking name never removes the
+        # human gate its catalogue entry declares.
+        self.assertEqual("communication_requires_human", self.decide("code.sync_review")["reason_code"])
+        self.assertEqual("spending_requires_human", self.decide("deploy.release_notes")["reason_code"])
+
+    def test_caller_parameters_cannot_remove_communication_or_spending_classification(self):
+        for action, reason_code in (("communication.send", "communication_requires_human"),
+                                    ("purchase.place_order", "spending_requires_human")):
+            for tricky in ({}, {"summary": "internal only", "dry_run": True},
+                           {"summary": "no-op", "details": {"internal": True, "amount": 0}}):
+                with self.subTest(action=action, tricky=tricky):
+                    request = request_snapshot(action=action, parameters=dict(tricky))
+                    decision = self.decide(request=request)
+                    self.assertFalse(decision["matched"])
+                    self.assertEqual(reason_code, decision["reason_code"])
+
+    def test_prohibited_uncatalogued_and_unclassified_actions_stay_closed(self):
+        self.assertEqual("action_prohibited_by_catalogue", self.decide("system.shell.execute")["reason_code"])
         self.assertEqual("action_not_catalogued", self.decide("home.unlisted.action")["reason_code"])
+        self.assertEqual("gate_class_undeclared", self.decide("legacy.unclassified.action")["reason_code"])
+        self.assertEqual("action_not_catalogued", self.decide("code.edit_file", catalogue=None)["reason_code"])
+        self.assertEqual("action_not_catalogued", self.decide("code.edit_file", catalogue={"actions": []})["reason_code"])
+
+    def test_execution_mode_pause_disable_identity_and_step_up_are_hard_stops(self):
         self.assertEqual("global_rule_requires_simulation_only", self.decide("code.edit_file", execution_enabled=True)["reason_code"])
+        self.assertEqual("global_rule_requires_simulation_only", self.decide("code.edit_file", execution_enabled=None)["reason_code"])
         self.assertEqual("auto_approval_paused", self.decide("code.edit_file", paused=True)["reason_code"])
         self.assertEqual("rule_disabled", self.decide("code.edit_file", disabled_rules=("rule-global-simulation",))["reason_code"])
         self.assertEqual("requester_not_declared", self.decide(request=request_snapshot(action="code.edit_file", requester="agent-other", parameters={}))["reason_code"])
@@ -401,16 +433,16 @@ class GlobalSimulationRuleTests(unittest.TestCase):
         self.assertEqual("step_up_requires_independent_transport", self.decide(request=request_snapshot(action="code.edit_file", effective_control="step_up", parameters={}))["reason_code"])
 
     def test_sensitive_parameters_stay_human_even_under_the_global_rule(self):
-        cases = {
-            "parameter_looks_like_secret": {"api_key": "example-token-value-never-project"},
-            "parameter_looks_like_secret": {"details": {"nested": {"password": "example-secret"}}},
-            "command_parameter_forbidden": {"command": "rm -rf /"},
-            "spending_requires_human": {"amount": 10},
-            "communication_requires_human": {"recipient": "supplier@example.test"},
-            "destructive_git_requires_human": {"force": True},
-        }
-        for reason_code, extra in cases.items():
-            with self.subTest(reason_code=reason_code):
+        cases = (
+            ("parameter_looks_like_secret", {"api_key": "example-token-value-never-project"}),
+            ("parameter_looks_like_secret", {"details": {"nested": {"password": "example-secret"}}}),
+            ("command_parameter_forbidden", {"command": "rm -rf /"}),
+            ("spending_requires_human", {"amount": 10}),
+            ("communication_requires_human", {"recipient": "supplier@example.test"}),
+            ("destructive_git_requires_human", {"force": True}),
+        )
+        for reason_code, extra in cases:
+            with self.subTest(reason_code=reason_code, extra=sorted(extra)):
                 request = request_snapshot(action="code.edit_file", parameters={"summary": "Simulate", **extra})
                 decision = self.decide(request=request)
                 self.assertFalse(decision["matched"])
@@ -418,28 +450,54 @@ class GlobalSimulationRuleTests(unittest.TestCase):
         allowed = self.decide(request=request_snapshot(action="code.edit_file", parameters={"summary": "Any free text is fine in simulation", "details": {"note": "no constraint needed"}}))
         self.assertTrue(allowed["matched"], allowed["reason"])
 
-    def test_the_declared_floor_cannot_be_shrunk_or_wildcarded(self):
+    def test_secret_screening_recurses_through_mappings_and_sequences_at_any_depth(self):
+        cases = (
+            ("parameter_looks_like_secret", {"details": {"a": {"b": {"c": {"d": {"password": "deep"}}}}}}),
+            ("parameter_looks_like_secret", {"details": {"layers": [{"steps": [{"api_key": "nested-in-lists"}]}]}}),
+            ("parameter_looks_like_secret", {"details": [[["sk-example-secret-material"]]]}),
+            ("parameter_looks_like_secret", {"details": {"a": [{"b": ["Bearer example-value"]}]}}),
+            ("command_parameter_forbidden", {"details": {"a": {"b": {"c": {"d": [{"command": "rm -rf /"}]}}}}}),
+            ("spending_requires_human", {"details": [{"payment": {"kind": "card"}}]}),
+            ("communication_requires_human", {"details": {"drafts": [{"recipient": "person@example.test"}]}}),
+            ("destructive_git_requires_human", {"details": {"a": [{"force": True}]}}),
+        )
+        for reason_code, extra in cases:
+            with self.subTest(reason_code=reason_code):
+                request = request_snapshot(action="code.edit_file", parameters={"summary": "Simulate", **extra})
+                decision = self.decide(request=request)
+                self.assertFalse(decision["matched"])
+                self.assertEqual(reason_code, decision["reason_code"])
+        deep_clean = {"summary": "Simulate", "details": {"a": [{"b": [{"c": {"d": ["harmless", 7, True]}}]}]}}
+        allowed = self.decide(request=request_snapshot(action="code.edit_file", parameters=deep_clean))
+        self.assertTrue(allowed["matched"], allowed["reason"])
+
+    def test_the_declared_human_gate_classes_cannot_be_shrunk_extended_or_renamed(self):
         for broken in (
-            {**GLOBAL_RULE, "prohibited_classes": ["spending"]},
-            {**GLOBAL_RULE, "prohibited_classes": []},
-            {**GLOBAL_RULE, "prohibited_classes": sorted(PROHIBITED_CLASSES) + ["anything"]},
+            {**GLOBAL_RULE, "human_gate_classes": ["human_communication"]},
+            {**GLOBAL_RULE, "human_gate_classes": []},
+            {**GLOBAL_RULE, "human_gate_classes": sorted(HUMAN_GATE_CLASSES) + ["credentials"]},
+            {**GLOBAL_RULE, "human_gate_classes": ["automatic", "prohibited"]},
+            {**GLOBAL_RULE, "human_gate_classes": "human_communication,human_spending"},
             {**GLOBAL_RULE, "requesters": ["*"]},
             {**GLOBAL_RULE, "nodes": []},
             {**GLOBAL_RULE, "version": "1"},
             {key: value for key, value in GLOBAL_RULE.items() if key != "review_by"},
+            {key: value for key, value in GLOBAL_RULE.items() if key != "human_gate_classes"} | {"prohibited_classes": sorted(HUMAN_GATE_CLASSES)},
             {**GLOBAL_RULE, "actions": ["code.edit_file"]},
         ):
             with self.subTest(rule=sorted(broken)[0]):
                 with self.assertRaises(AutoApprovalPolicyError):
                     AutoApprovalPolicy({**GLOBAL_DOCUMENT, "global_simulation_rule": broken})
-        self.assertEqual(
-            {"credentials", "spending", "external_communication", "destructive_git",
-             "undeclared_infrastructure", "arbitrary_command"},
-            set(PROHIBITED_CLASSES),
-        )
+        self.assertEqual(("human_communication", "human_spending"), HUMAN_GATE_CLASSES)
         self.assertEqual("rule-global-simulation", self.policy.global_simulation_rule["rule_id"])
+        self.assertEqual(tuple(sorted(HUMAN_GATE_CLASSES)), self.policy.global_simulation_rule["human_gate_classes"])
         with self.assertRaises(TypeError):
             self.policy.global_simulation_rule["version"] = 2
+
+    def test_classification_is_metadata_only_with_no_token_vocabulary_left(self):
+        self.assertFalse(hasattr(autoapproval, "PROHIBITED_CLASSES"))
+        self.assertFalse(hasattr(autoapproval, "FORBIDDEN_ACTION_TOKENS"))
+        self.assertFalse(hasattr(autoapproval, "prohibited_class"))
 
 
 if __name__ == "__main__":

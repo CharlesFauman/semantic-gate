@@ -127,20 +127,35 @@ checked-in document declares an immutable version, an optional standing
 simulation-only rule and zero or more scoped rules. Matching is dry-runnable and
 explains itself with closed reason codes that never echo parameter values.
 
+Every catalogue entry must declare exactly one member of the closed four-way
+`gate_class` vocabulary: `automatic`, `human_communication`, `human_spending` or
+`prohibited`. The standing rule is *automatic except communications and
+spending*: every catalogued non-prohibited action auto-approves for simulation,
+while `human_communication` and `human_spending` entries always keep the human
+gate and `prohibited` entries are not requestable. Classification comes solely
+from that metadata — action-name tokens and caller parameters never reclassify
+an action — and the standing rule must declare `human_gate_classes` in full,
+so a document can neither shrink nor extend the human gate. Parameters can only
+fail a request toward the human gate: secret material, command fields and
+destructive flags are screened recursively through nested objects and arrays at
+every depth the request domain accepts.
+
 ```text
 shared guards (policy enabled, human pause, policy version, waiting state,
-               exact challenge, step-up, arbitrary-command hard stop)
+               exact challenge, step-up)
   → scoped rules (canonical repository, exact refs, declared target/environment,
                   requester/node, commit identity, closed parameter constraints)
-  → standing simulation rule (catalogue membership, catalogue prohibitions,
-                              prohibited safety floor, sensitive-parameter floor)
+  → standing simulation rule (execution disabled, catalogue membership,
+                              gate_class metadata classification,
+                              recursive sensitive-parameter screening)
   → single-request evidence bound to rule ID/version, request ID/hash and commit
 ```
 
-The coordinator re-evaluates at ingestion time, so a scope or commit change
-between match and ingestion voids the evidence. Approval evidence carries
-`authorizes_execution: false`; execution still requires enabling policy and a
-host-owned `ExecutionAuthority`.
+The coordinator owns the authoritative catalogue and passes it, together with
+the live policy `execution_enabled` flag, into every evaluation; it re-evaluates
+at ingestion time, so a scope or commit change between match and ingestion voids
+the evidence. Approval evidence carries `authorizes_execution: false`; execution
+still requires enabling policy and a host-owned `ExecutionAuthority`.
 
 ### Decision-card projection and panel feeds
 

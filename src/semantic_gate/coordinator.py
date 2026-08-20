@@ -9,6 +9,7 @@ import secrets
 from typing import Any
 
 from . import autoapproval
+from .catalog import validate_catalog
 from .engine import ApprovalRejected, GatewayEngine, RecordingNotifier, ToolRegistry
 
 
@@ -38,11 +39,15 @@ class HostApprovalVerifier:
 
 class CoreBackend:
     APPROVAL_ABSOLUTE_CAP_SECONDS = 6 * 60 * 60
+    TERMINAL_STATES = frozenset({"blocked", "cancelled", "simulated", "executed", "failed", "expired", "denied"})
 
-    def __init__(self, policy: dict, *, approval_key: bytes, clock, notifier=None, auto_approval=None, auto_approval_path_resolver=None):
+    def __init__(self, policy: dict, *, approval_key: bytes, clock, notifier=None, auto_approval=None, auto_approval_path_resolver=None, catalog=None):
         self.clock = clock
         self.verifier = HostApprovalVerifier(approval_key)
         self.auto_approval = auto_approval
+        self.catalog = None if catalog is None else validate_catalog(catalog)
+        if auto_approval is not None and auto_approval.global_simulation_rule is not None and self.catalog is None:
+            raise ValueError("a standing auto-approval rule requires the authoritative action catalogue")
         self._auto_approval_path_resolver = auto_approval_path_resolver
         self._decision_challenges: dict[str,dict] = {}
         self._trusted_nodes: dict[str,str] = {}
@@ -63,6 +68,29 @@ class CoreBackend:
             clock=self.clock,
         )
 
+    @property
+    def execution_enabled(self) -> bool:
+        """The live execution flag of the loaded policy, never a cached copy."""
+        return self.engine.policy["execution_enabled"] is True
+
+    def _forget(self, request_id: str) -> None:
+        """Purge challenge and trusted-node bindings for one request."""
+        self._decision_challenges.pop(request_id, None)
+        self._trusted_nodes.pop(request_id, None)
+
+    def _observe_state(self, request: dict) -> dict:
+        """Purge binding state whenever a terminal or expired request is observed."""
+        request_id = request.get("request_id")
+        if not isinstance(request_id, str):
+            return request
+        if request.get("state") in self.TERMINAL_STATES:
+            self._forget(request_id)
+            return request
+        challenge = self._decision_challenges.get(request_id)
+        if challenge is not None and challenge["expires_at"] <= int(self.clock()):
+            self._forget(request_id)
+        return request
+
     def list_actions(self, principal: str):
         return self.engine.list_actions(principal=principal)
 
@@ -73,7 +101,7 @@ class CoreBackend:
         request=self.engine.request_action(**kwargs)
         trusted=kwargs.get("trusted_context")
         node=trusted.get("node") if isinstance(trusted,dict) else None
-        if isinstance(node,str) and node:
+        if isinstance(node,str) and node and request.get("state") not in self.TERMINAL_STATES:
             self._trusted_nodes[request["request_id"]]=node
         if request.get("state")=="waiting_for_approval":
             notification=next((gate for gate in request["gates"] if gate["kind"]=="notify"),None)
@@ -130,6 +158,8 @@ class CoreBackend:
             paused=paused,
             disabled_rules=disabled_rules,
             path_resolver=self._auto_approval_path_resolver,
+            catalogue=self.catalog,
+            execution_enabled=self.execution_enabled,
         )
 
     def auto_approve(self, request_id: str, decision: dict, *, node: str | None = None) -> tuple[dict, dict, dict]:
@@ -150,8 +180,7 @@ class CoreBackend:
             raise ApprovalRejected("auto-approval commit identity changed since the match")
         evidence["signature"] = self.verifier.sign(evidence)
         decided = self.engine.ingest_trusted_approval(request_id, evidence)
-        self._decision_challenges.pop(request_id, None)
-        self._trusted_nodes.pop(request_id, None)
+        self._forget(request_id)
         return decided, evidence, autoapproval.audit_metadata(fresh, request)
 
     def approval_challenge(self, request_id: str) -> dict | None:
@@ -160,11 +189,13 @@ class CoreBackend:
 
     def get_request(self, request_id: str, requester: str | None = None):
         if requester is None:
-            return self.engine.get_request(request_id)
-        return self.engine.get_request_for(request_id, requester=requester)
+            return self._observe_state(self.engine.get_request(request_id))
+        return self._observe_state(self.engine.get_request_for(request_id, requester=requester))
 
     def cancel_request(self, request_id: str, requester: str):
-        return self.engine.cancel_request(request_id, requester=requester)
+        cancelled = self.engine.cancel_request(request_id, requester=requester)
+        self._forget(request_id)
+        return cancelled
 
     def _decision(self, request_id: str, challenge: dict) -> tuple[dict, dict]:
         request = self.engine.get_request(request_id)
@@ -198,7 +229,7 @@ class CoreBackend:
         }
         evidence["signature"] = self.verifier.sign(evidence)
         decided=self.engine.ingest_trusted_approval(request_id,evidence)
-        self._decision_challenges.pop(request_id,None)
+        self._forget(request_id)
         return decided
 
     def deny_request(self, request_id: str, actor: str, challenge: dict):
@@ -212,5 +243,5 @@ class CoreBackend:
             "expires_at": challenge["expires_at"],
             "decided_at": int(self.clock()),
         })
-        self._decision_challenges.pop(request_id,None)
+        self._forget(request_id)
         return decided

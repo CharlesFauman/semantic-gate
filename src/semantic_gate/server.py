@@ -12,8 +12,8 @@ from http import cookies
 from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, urlsplit
 
-from . import autoapproval
 from .auth import AuthError, CapabilityAuthority, Principal
+from .catalog import HUMAN_GATE_CLASSES
 from .controller import GateControl, GateControlError, GateDecisionConflict
 from .credentials import CredentialRegistry
 from .engine import GatePolicyError, _validate_json_value
@@ -160,8 +160,8 @@ class SemanticGateApplication:
     FEED_LABELS = {"decisions":"Gate decisions","denials":"Policy denials","gate_errors":"Gate errors",
                    "withdrawn":"Withdrawn or expired","telemetry":"Execution telemetry"}
 
-    def __init__(self, control: GateControl, authority: CapabilityAuthority, credentials: CredentialRegistry, *, catalog: Mapping[str, Any], admin_password: str, admin_principal_id: str = "control", origins: Sequence[str], clock, secure_cookies: bool = True, status_provider=None, auto_approval=None):
-        self.control=control; self.authority=authority; self.credentials=credentials; self.auto_approval=auto_approval
+    def __init__(self, control: GateControl, authority: CapabilityAuthority, credentials: CredentialRegistry, *, catalog: Mapping[str, Any], admin_password: str, admin_principal_id: str = "control", origins: Sequence[str], clock, secure_cookies: bool = True, status_provider=None):
+        self.control=control; self.authority=authority; self.credentials=credentials
         self.catalog=dict(catalog); self.admin_password=admin_password; self.admin_principal_id=admin_principal_id; self.clock=clock; self.secure_cookies=secure_cookies
         self.status_provider=status_provider or (lambda:{})
         self.origins=frozenset(origin.rstrip("/") for origin in origins)
@@ -249,6 +249,14 @@ class SemanticGateApplication:
         return (f"<article class='decision {html.escape(card['urgency'])}'>{render_decision_card_html(card)}{explanation}"
                 f"{self._decision_controls(item,csrf=csrf,card=card)}{_request_review(item)}</article>")
 
+    def _wired_auto_approval(self):
+        """The auto-approval policy actually wired into the backend, never a separate copy."""
+        return getattr(self.control.backend, "auto_approval", None)
+
+    def _wired_execution_enabled(self) -> bool:
+        """The live execution flag of the effective wired backend path."""
+        return getattr(self.control.backend, "execution_enabled", False) is True
+
     def _rule_state(self, rule: Mapping[str,Any], *, now: int, controls: Mapping[str,Any]) -> str:
         if str(rule["rule_id"]) in (controls.get("disabled_auto_rules") or []): return "Disabled"
         if int(rule["expires_at"])<=now: return "Expired"
@@ -257,7 +265,7 @@ class SemanticGateApplication:
 
     def _rule_scope(self, rule: Mapping[str,Any]) -> str:
         if rule["action_class"]=="global_simulation":
-            return "Standing: every catalogued action above the prohibited safety floor, simulation only"
+            return "Standing: every catalogued non-prohibited action, automatic except communications and spending, simulation only"
         parts=[f"class {rule['action_class']}",", ".join(rule["actions"]),f"repo {rule['repository']}",", ".join(rule["refs"])]
         if rule["environments"]: parts.append("environments "+", ".join(rule["environments"]))
         if rule["targets"]: parts.append("targets "+", ".join(rule["targets"]))
@@ -265,13 +273,20 @@ class SemanticGateApplication:
         parts.append("nodes "+", ".join(rule["nodes"]))
         return " | ".join(parts)
 
+    _HUMAN_GATE_DESCRIPTIONS = {
+        "human_communication": "communication, sending or disclosure to a person or external recipient",
+        "human_spending": "spending, transferring, purchasing or committing money",
+    }
+
     def _auto_approval_section(self, csrf: str, *, now: int, controls: Mapping[str,Any]) -> str:
-        if self.auto_approval is None:
+        policy=self._wired_auto_approval()
+        if policy is None:
             return ("<section aria-labelledby=rules-heading><h2 id=rules-heading>Auto-approval rules</h2>"
                     "<p class=muted>No auto-approval policy is configured; every gated request asks a human.</p></section>")
+        execution_enabled=self._wired_execution_enabled()
         paused=controls.get("auto_approval_paused") is True
         disabled=list(controls.get("disabled_auto_rules") or [])
-        rules=[rule for rule in (self.auto_approval.global_simulation_rule,) if rule is not None]+list(self.auto_approval.rules)
+        rules=[rule for rule in (policy.global_simulation_rule,) if rule is not None]+list(policy.rules)
         rows=""
         for rule in rules:
             rule_id=str(rule["rule_id"]); state=self._rule_state(rule,now=now,controls=controls)
@@ -285,20 +300,25 @@ class SemanticGateApplication:
                    f"<td>{html.escape(self._rule_scope(rule))}</td><td><b>{html.escape(state)}</b></td>"
                    f"<td>Next review {html.escape(_utc(rule['review_by']))}<br>Expires {html.escape(_utc(rule['expires_at']))}</td>"
                    f"<td>{toggle}</td></tr>")
-        floor=", ".join(sorted(autoapproval.PROHIBITED_CLASSES))
+        exclusions="; ".join(
+            f"{self._HUMAN_GATE_DESCRIPTIONS[name]} (<code>{html.escape(name)}</code>)" for name in HUMAN_GATE_CLASSES)
+        stop=("<b>execution_enabled=true</b>, so the standing simulation-only rule does not apply and every request asks a human"
+              if execution_enabled else
+              "<b>execution_enabled=false</b> is a separate hard stop, so nothing is executed")
         pause=(f"<form method=post action='/admin/controls'>{self._hidden({'csrf_token':csrf,'key':'auto_approval_paused','value':'false' if paused else 'true'})}"
                f"<button{'' if paused else ' class=danger'} type=submit>{'Resume auto-approval' if paused else 'Pause auto-approval'}</button></form>")
-        banner=("<p class=banner><b>GLOBAL AUTO-APPROVE</b> - simulation only. Policy approves the approval gate for "
-                "catalogued safe work; <b>execution_enabled=false</b> is a separate hard stop, so nothing is executed.</p>"
-                if self.auto_approval.global_simulation_rule is not None else
-                "<p class=banner><b>Scoped auto-approval only</b> - simulation only; execution_enabled=false remains a separate hard stop.</p>")
+        banner=(f"<p class=banner><b>Automatic except communications and spending</b> - every catalogued non-prohibited "
+                f"action is auto-approved, simulation only. Always asks a human: {exclusions}. Prohibited catalogue "
+                f"entries are not requestable. {stop}.</p>"
+                if policy.global_simulation_rule is not None else
+                f"<p class=banner><b>Scoped auto-approval only</b> - simulation only; {stop}.</p>")
         state_line="<p class=warn>Auto-approval is paused by a human; every request asks a human.</p>" if paused else "<p class=muted>Auto-approval is active for the declared scope below.</p>"
         return ("<section aria-labelledby=rules-heading><h2 id=rules-heading>Auto-approval rules</h2>"
                 f"{banner}{state_line}<div class=actions>{pause}</div>"
                 "<table><thead><tr><th scope=col>Rule</th><th scope=col>Version</th><th scope=col>Declared scope</th>"
                 "<th scope=col>State</th><th scope=col>Review</th><th scope=col>Human control</th></tr></thead>"
                 f"<tbody>{rows}</tbody></table>"
-                f"<p><b>Always asks a human:</b> {html.escape(floor)}</p>"
+                f"<p><b>Always asks a human:</b> {html.escape(', '.join(HUMAN_GATE_CLASSES))}</p>"
                 "<p class=muted>Rules are checked-in and host-owned. No agent-callable surface can create, edit, "
                 "enable, disable or pause them.</p></section>")
 
@@ -371,6 +391,13 @@ class SemanticGateApplication:
                          f"{int(outbox.get('pending',0))} pending · {int(outbox.get('unknown',0))} unknown</p>"
                          f"<p class=muted>Last success: {html.escape(_utc(relay.get('last_success_at')))} · "
                          f"Last error: {html.escape(str(relay.get('last_error') or 'none'))}</p>")
+        execution_enabled=self._wired_execution_enabled()
+        headline=("Execution is enabled by the loaded policy; simulation-only gates still simulate."
+                  if execution_enabled else "Execution is globally disabled; decisions simulate only.")
+        execution_banner=("<p class=banner>Execution is enabled by the loaded policy: <b>execution_enabled=true</b>. "
+                          "Human approval and a host execution authority are still required for any live effect.</p>"
+                          if execution_enabled else
+                          "<p class=banner>Execution is globally disabled: <b>execution_enabled=false</b>, simulation only.</p>")
         cards="".join(self._decision_card(item,csrf=csrf,now=now) for item in pending) or "<p class=muted>No decision is waiting.</p>"
         history="".join(
             f"<tr><td><code>{html.escape(str(item.get('request_id','')))}</code></td><td>{html.escape(str(item.get('action','')))}</td>"
@@ -386,9 +413,9 @@ class SemanticGateApplication:
               f"<meta http-equiv=refresh content=20>"
               f"<title>Semantic Gate decisions</title><style>{_PANEL_CSS}</style></head><body>"
               f"<a class=skip href='#pending'>Skip to pending decisions</a><main>"
-              f"<h1>Semantic Gate</h1><p class=muted>Execution is globally disabled; decisions simulate only.</p>"
+              f"<h1>Semantic Gate</h1><p class=muted>{headline}</p>"
               f"<section aria-labelledby=delivery-heading><h2 id=delivery-heading>Coordinator health</h2>"
-              f"<p class=banner>Execution is globally disabled: <b>execution_enabled=false</b>, simulation only.</p>"
+              f"{execution_banner}"
               f"{delivery_banner}</section>"
               f"<section id=pending aria-labelledby=pending-heading><h2 id=pending-heading>Pending decisions ({len(pending)})</h2>{cards}</section>"
               f"{self._feed_section(feed,audit_events=audit_events,observations=self.control.ledger.recent_observations(limit=200))}"
@@ -446,7 +473,7 @@ class SemanticGateApplication:
     def handle(self, method: str, path: str, headers: Mapping[str,str], body: bytes) -> Response:
         route=urlsplit(path).path
         try:
-            if route=="/health" and method=="GET": return _json(200,{"status":"ok","execution_enabled":False,**self.status_provider()})
+            if route=="/health" and method=="GET": return _json(200,{"status":"ok","execution_enabled":self._wired_execution_enabled(),**self.status_provider()})
             if route=="/login" and method=="GET": return self._login_page()
             if route=="/login" and method=="POST":
                 is_form=(_header(headers,"Content-Type") or "").split(";",1)[0].strip().casefold()=="application/x-www-form-urlencoded"

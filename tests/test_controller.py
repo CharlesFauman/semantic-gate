@@ -37,8 +37,8 @@ class AutoApprovingBackend:
     def auto_approval_decision(self, request, *, paused=False, disabled_rules=()):
         self.seen.append((paused, tuple(disabled_rules)))
         if not self.matched:
-            return {"matched": False, "reason_code": "prohibited_class_requires_human",
-                    "reason": "The action falls inside the prohibited safety floor. (class: spending)"}
+            return {"matched": False, "reason_code": "spending_requires_human",
+                    "reason": "Spending, transferring, purchasing or committing money always requires a human decision. (class: human_spending)"}
         return {"matched": True, "reason_code": "matched_global_simulation_scope",
                 "reason": "Matched the standing simulation-only rule; nothing is executed.",
                 "rule_id": "rule-global-simulation", "rule_version": 1,
@@ -218,8 +218,8 @@ class AutoApprovalOrchestrationTests(unittest.TestCase):
         request = self.propose(self.control_for(backend))
         self.assertEqual("waiting_for_approval", request["state"])
         self.assertFalse(request["auto_approval"]["matched"])
-        self.assertEqual("prohibited_class_requires_human", request["auto_approval"]["reason_code"])
-        self.assertIn("spending", request["auto_approval"]["reason"])
+        self.assertEqual("spending_requires_human", request["auto_approval"]["reason_code"])
+        self.assertIn("human_spending", request["auto_approval"]["reason"])
         self.assertEqual(["requested"], [event["event"] for event in self.ledger.audit_events()])
 
     def test_human_pause_and_rule_disable_controls_reach_the_matcher(self):

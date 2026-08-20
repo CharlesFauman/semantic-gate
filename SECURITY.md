@@ -45,13 +45,19 @@ access to the downstream effectful tools that Semantic Gate is meant to gate.
     policy and is never reachable from an agent-callable surface. Pausing,
     enabling and disabling rules are authenticated human control-plane
     operations with the same Origin and session-CSRF requirements as decisions.
-21. The prohibited safety floor must be declared in full and cannot be shrunk.
-    Credentials/secrets, spending, external human communication, destructive or
-    irreversible git, undeclared infrastructure effects and arbitrary
-    terminal/shell/command actions always require a human. The standing rule
-    additionally requires `execution_enabled=false`; catalogue membership and
-    catalogue prohibitions are enforced, and there is no wildcard that bypasses
-    them.
+21. Classification is metadata-only. Every catalogue entry must declare exactly
+    one `gate_class` from the closed vocabulary `automatic`,
+    `human_communication`, `human_spending`, `prohibited`; the standing rule
+    must declare the human gate classes in full and cannot shrink or extend
+    them. Communication/sending/disclosure to a person or external recipient
+    and spending/transferring/purchasing/committing money always require a
+    human; prohibited entries are unrequestable. Action names and caller
+    parameters never reclassify an action, and parameters can only fail a
+    request toward the human gate: secret material, command fields and
+    destructive flags are screened recursively through nested objects and
+    arrays. The standing rule additionally requires `execution_enabled=false`;
+    catalogue membership is enforced, and there is no wildcard that bypasses
+    it.
 22. Decision-card projection is closed and bounded. Only action-schema-owned
     presentation fields are projected, sanitized to a printable allowlist,
     length-bounded and escaped. A changed commit voids auto-approval evidence.

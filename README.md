@@ -87,16 +87,24 @@ through the gateway directly.
   status for `/health` and the authenticated panel. Delivery ambiguity remains
   explicit rather than being retried as though a send definitely failed.
 - **Policy-owned auto-approval:** an optional checked-in document may auto-approve
-  the approval gate. The bundled standing rule is simulation-only: it applies to
-  catalogued actions above an explicit prohibited safety floor, never authorizes
-  execution, and cannot shrink that floor. Scoped rules bind one canonical
-  repository, exact refs, declared deploy target/environment, host-authenticated
-  requester/node, closed parameter constraints and a commit identity. Rules are
-  host-owned; agents cannot create, edit, enable, disable or pause them.
+  the approval gate. The bundled standing rule is simulation-only and **automatic
+  except communications and spending**: every catalogued non-prohibited action is
+  auto-approved unless its required `gate_class` catalogue metadata is
+  `human_communication` (communication/sending/disclosure to a person or external
+  recipient) or `human_spending` (spending/transferring/purchasing/committing
+  money), which always keep the human gate; `prohibited` entries are not
+  requestable at all. Classification is metadata-only: action names and caller
+  parameters never reclassify an action, so an internal deploy or a read-only
+  balance query classified `automatic` is not overexcluded. Scoped rules bind one
+  canonical repository, exact refs, declared deploy target/environment,
+  host-authenticated requester/node, closed parameter constraints and a commit
+  identity. Rules are host-owned; agents cannot create, edit, enable, disable or
+  pause them.
 - **Auto-approval is not execution:** matched requests still pass schema
   validation, prechecks, the approval gate, the post-approval recheck and
   single-request evidence/audit. `execution_enabled=false` remains a separate
-  hard stop.
+  hard stop, and the standing rule refuses to apply at all while execution is
+  enabled.
 - **Bounded decision cards:** out-of-band notices project only closed,
   schema-owned presentation fields, deterministically sanitized, length-bounded
   and escaped. Parameters, prompts, commands, paths, message bodies and
@@ -177,7 +185,10 @@ See [`examples/`](examples/) for calendar, purchase and device-control flows.
 - SQLite request snapshots, audit events, emergency controls and a durable
   notification-outbox foundation;
 - host-derived principal capabilities;
-- redacted credential-binding inventory.
+- redacted credential-binding inventory;
+- an optional declarative `--auto-approval` policy path that wires the checked-in
+  auto-approval document, the authoritative catalogue and the live execution flag
+  into the effective backend the panel reports on.
 
 `SemanticGateClient` provides the same proposal contract without MCP. Local and
 remote execution plugins implement `ActionPlugin` and run behind `NodeBroker`.

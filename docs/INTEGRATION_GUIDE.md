@@ -113,7 +113,9 @@ and does not relax the engine's existing exact evidence checks.
 ## Auto-approval and decision cards
 
 Pass a checked-in document to the coordinator to enable policy-owned
-auto-approval:
+auto-approval. The backend owns the authoritative catalogue and the live
+`execution_enabled` flag; the panel derives its banner from that effective
+wired backend path, so there is no separately assigned policy document:
 
 ```python
 backend = CoreBackend(
@@ -123,15 +125,22 @@ backend = CoreBackend(
     notifier=notifier,
     auto_approval=AutoApprovalPolicy(document),
     auto_approval_path_resolver=host_workspace_containment_check,
+    catalog=catalog,  # required for the standing rule; validated gate_class metadata
 )
-app = SemanticGateApplication(..., auto_approval=backend.auto_approval)
+app = SemanticGateApplication(GateControl(backend, ledger, clock=clock), ...)
 ```
 
+The bundled `semantic-gate-server` host wires the same path declaratively with
+`--auto-approval path/to/document.json`.
+
 `examples/auto-approval/global-simulation.json` is a generic starting point. The
-standing rule is simulation-only and cannot shrink the prohibited safety floor;
-scoped rules are the promotion path for later execution-enabled work. A path
-parameter never auto-approves unless the host supplies a resolver that confirms
-containment, because the matcher must not touch the filesystem.
+standing rule is simulation-only and *automatic except communications and
+spending*: every catalogue entry must declare exactly one `gate_class` from
+`automatic`, `human_communication`, `human_spending` or `prohibited`, and the
+two human gate classes always keep the human gate while prohibited entries stay
+unrequestable. Scoped rules are the promotion path for later execution-enabled
+work. A path parameter never auto-approves unless the host supplies a resolver
+that confirms containment, because the matcher must not touch the filesystem.
 
 For out-of-band notices, project a bounded decision card instead of a bare
 template string:
