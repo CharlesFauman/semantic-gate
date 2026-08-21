@@ -105,13 +105,14 @@ class Ledger:
             row=self._db.execute("SELECT * FROM notification_outbox WHERE notification_id=?",(notification_id,)).fetchone()
         return self._notification(row)
 
-    def notifications_for_request(self, request_id: str) -> list[dict]:
+    def notifications_for_request(self, request_id: str, *, limit: int = 100) -> list[dict]:
         if not isinstance(request_id,str) or not request_id:
             raise ValueError("request_id must be a non-empty string")
+        limit=max(1,min(int(limit),1000))
         with self._lock:
             rows=self._db.execute(
-                "SELECT * FROM notification_outbox WHERE request_id=? ORDER BY created_at,notification_id",
-                (request_id,),
+                "SELECT * FROM notification_outbox WHERE request_id=? ORDER BY created_at,notification_id LIMIT ?",
+                (request_id,limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -223,11 +224,37 @@ class Ledger:
             row = self._db.execute("SELECT snapshot_json FROM requests WHERE request_id=?", (request_id,)).fetchone()
         return json.loads(row[0]) if row else None
 
-    def list_requests(self, *, limit: int = 100) -> list[dict]:
+    @staticmethod
+    def _request_filter(state: str | None, exclude_state: str | None) -> tuple[str, list[Any]]:
+        clauses: list[str] = []; args: list[Any] = []
+        if state is not None:
+            clauses.append("state=?"); args.append(str(state))
+        if exclude_state is not None:
+            clauses.append("state<>?"); args.append(str(exclude_state))
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
+
+    def list_requests(self, *, limit: int = 100, offset: int = 0, state: str | None = None,
+                      exclude_state: str | None = None) -> list[dict]:
         limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        where, args = self._request_filter(state, exclude_state)
         with self._lock:
-            rows = self._db.execute("SELECT snapshot_json FROM requests ORDER BY updated_at DESC, request_id DESC LIMIT ?", (limit,)).fetchall()
+            rows = self._db.execute(
+                "SELECT snapshot_json FROM requests" + where +
+                " ORDER BY updated_at DESC, request_id DESC LIMIT ? OFFSET ?",
+                (*args, limit, offset)).fetchall()
         return [json.loads(row[0]) for row in rows]
+
+    def count_requests(self, *, state: str | None = None, exclude_state: str | None = None) -> int:
+        where, args = self._request_filter(state, exclude_state)
+        with self._lock:
+            row = self._db.execute("SELECT COUNT(*) FROM requests" + where, args).fetchone()
+        return int(row[0])
+
+    def request_state_counts(self) -> dict[str, int]:
+        with self._lock:
+            rows = self._db.execute("SELECT state, COUNT(*) AS count FROM requests GROUP BY state").fetchall()
+        return {str(row["state"]): int(row["count"]) for row in rows}
 
     def audit_events(self, request_id: str | None = None, *, limit: int = 500) -> list[dict]:
         limit = max(1, min(int(limit), 1000))

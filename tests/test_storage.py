@@ -32,6 +32,25 @@ class LedgerTests(unittest.TestCase):
         finally:
             reopened.close()
 
+    def test_list_requests_paginates_stably_with_state_filters_and_counts(self):
+        for index in range(7):
+            state = "waiting_for_approval" if index < 3 else "denied"
+            self.ledger.record_request({"request_id": f"req_{index}", "action": "x.y", "requester": "agent",
+                                        "state": state, "created_at": 100, "updated_at": 100},
+                                       event="requested", actor="agent")
+        self.assertEqual({"waiting_for_approval": 3, "denied": 4}, self.ledger.request_state_counts())
+        self.assertEqual(4, self.ledger.count_requests(state="denied"))
+        self.assertEqual(4, self.ledger.count_requests(exclude_state="waiting_for_approval"))
+        first = [row["request_id"] for row in self.ledger.list_requests(limit=3, offset=0, state="denied")]
+        second = [row["request_id"] for row in self.ledger.list_requests(limit=3, offset=3, state="denied")]
+        self.assertEqual(3, len(first))
+        self.assertEqual(1, len(second))
+        self.assertEqual({"req_3", "req_4", "req_5", "req_6"}, set(first) | set(second))
+        self.assertEqual(first, [row["request_id"] for row in self.ledger.list_requests(limit=3, state="denied")])
+        pending = self.ledger.list_requests(state="waiting_for_approval", limit=10)
+        self.assertEqual({"req_0", "req_1", "req_2"}, {row["request_id"] for row in pending})
+        self.assertEqual([], self.ledger.list_requests(limit=5, offset=10))
+
     def test_restart_expires_unresolved_requests_without_reviving_them(self):
         for state in ("processing", "waiting_for_approval"):
             self.ledger.record_request({"request_id":f"req_{state}","action":"x.y","requester":"agent","state":state,"created_at":100}, event="requested", actor="agent")
@@ -161,6 +180,22 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(7,reopened.schema_version())
         finally:
             reopened.close()
+
+    def test_notifications_for_request_applies_a_storage_level_limit(self):
+        rows=[(f"notice_{index:08x}","req_bulk","a"*64,"notify","owner",format(index,"064x"),"pending",0,index,index)
+              for index in range(10_000)]
+        with self.ledger._lock,self.ledger._db:
+            self.ledger._db.executemany(
+                """INSERT INTO notification_outbox(notification_id,request_id,request_hash,notify_gate_id,
+                   recipient,template_hash,state,attempts,next_attempt_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                rows)
+        limited=self.ledger.notifications_for_request("req_bulk",limit=17)
+        self.assertEqual(17,len(limited))
+        self.assertEqual([f"notice_{index:08x}" for index in range(17)],
+                         [row["notification_id"] for row in limited])
+        self.assertEqual(100,len(self.ledger.notifications_for_request("req_bulk")))
+        self.assertEqual(1000,len(self.ledger.notifications_for_request("req_bulk",limit=100_000)))
+        self.assertEqual(1,len(self.ledger.notifications_for_request("req_bulk",limit=0)))
 
     def test_concurrent_outbox_claim_has_one_winner(self):
         self.ledger.enqueue_notification(request_id="req_race",request_hash="e"*64,notify_gate_id="notify",recipient="owner",template_hash="f"*64,now=1)

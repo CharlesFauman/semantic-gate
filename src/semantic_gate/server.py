@@ -19,6 +19,15 @@ from .controller import GateControl, GateControlError, GateDecisionConflict
 from .credentials import CredentialRegistry
 from .engine import GatePolicyError, _validate_json_value
 from .projection import build_decision_card, collapse_observations, partition_audit_events, render_decision_card_html
+from .record import (
+    MAX_AUDIT,
+    MAX_NOTICES,
+    build_semantic_record,
+    presentation_safe_text,
+    redaction_fingerprint,
+    render_semantic_record_html,
+    schema_safe_fields,
+)
 
 
 @dataclass
@@ -113,38 +122,8 @@ def _utc(value: Any) -> str:
     return datetime.fromtimestamp(value,tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _request_review(request: Mapping[str, Any]) -> str:
-    parameters=request.get("parameters")
-    if not isinstance(parameters,Mapping): parameters={}
-    details=parameters.get("details")
-    if not isinstance(details,Mapping): details={}
-    def value(label: str, item: Any) -> str:
-        if item in (None,"",[],{}): return ""
-        rendered=item if isinstance(item,str) else json.dumps(item,ensure_ascii=False,sort_keys=True)
-        return f"<dt>{html.escape(label)}</dt><dd>{html.escape(rendered)}</dd>"
-    fields="".join(filter(None,(
-        value("Summary",parameters.get("summary")),
-        value("Target",parameters.get("target")),
-        value("Channel",details.get("channel")),
-        value("Recipient",details.get("recipient")),
-        value("Subject",details.get("subject")),
-        value("Listing ID",details.get("listing_id")),
-        value("Attachments",details.get("attachments")),
-    )))
-    message=details.get("body")
-    message_html=f"<h4>Message body</h4><pre class=message>{html.escape(message)}</pre>" if isinstance(message,str) and message else ""
-    canonical=json.dumps(parameters,ensure_ascii=False,sort_keys=True,separators=(",", ":"),allow_nan=False)
-    raw_challenge=request.get("approval_challenge")
-    challenge=raw_challenge if isinstance(raw_challenge,Mapping) else {}
-    expiry=challenge.get("expires_at","")
-    binding=(
-        "<h4>Canonical normalized parameters</h4>"
-        f"<pre>{html.escape(canonical)}</pre>"
-        f"<dl><dt>Request hash</dt><dd><code>{html.escape(str(request.get('request_hash','')))}</code></dd>"
-        f"<dt>Approval expires at</dt><dd>{html.escape(str(expiry))}</dd></dl>"
-        "<p>If this request expires, submit a new proposal; never reuse an old decision.</p>"
-    )
-    return f"<details class=request-review><summary>Review exact request</summary><dl>{fields}</dl>{message_html}{binding}</details>"
+# Stable detail routes are keyed by exact request identifiers only.
+_REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 
 
 MCP_TOOLS = [
@@ -160,6 +139,13 @@ class SemanticGateApplication:
     FEEDS = ("decisions","denials","gate_errors","withdrawn","telemetry")
     FEED_LABELS = {"decisions":"Gate decisions","denials":"Policy denials","gate_errors":"Gate errors",
                    "withdrawn":"Withdrawn or expired","telemetry":"Execution telemetry"}
+    HISTORY_STATES = ("all","simulated","executed","denied","blocked","cancelled","expired","failed")
+    PANEL_QUERY_PARAMS = frozenset({"feed","state","page","pending_page"})
+    HISTORY_PAGE_SIZE = 50
+    PENDING_PAGE_SIZE = 50
+    # Fail-closed serialized byte bounds enforced before any panel/detail response.
+    PANEL_MAX_BYTES = 4_000_000
+    DETAIL_MAX_BYTES = 1_000_000
 
     def __init__(self, control: GateControl, authority: CapabilityAuthority, credentials: CredentialRegistry, *, catalog: Mapping[str, Any], admin_password: str, admin_principal_id: str = "control", origins: Sequence[str], clock, secure_cookies: bool = True, status_provider=None, principal_contexts: Mapping[str, Mapping[str, Any]] | None = None):
         self.control=control; self.authority=authority; self.credentials=credentials
@@ -238,18 +224,115 @@ class SemanticGateApplication:
         approve=f"<form method=post action='/admin/requests/{request_id}/approve'>{hidden}<button type=submit>Approve once</button></form>"
         return f"<div class=actions>{approve}{deny}</div>"
 
-    def _decision_card(self, item: Mapping[str,Any], *, csrf: str, now: int) -> str:
+    def _request_review(self, request: Mapping[str,Any]) -> str:
+        """Sanitized review fragment. A detail field renders as screened text only
+        when the checked-in catalogue schema explicitly marks that field
+        presentation-safe; every other value - recipients, attachment names,
+        subjects and bodies included - appears solely as an explicit redaction
+        fingerprint. No raw parameter values."""
+        parameters=request.get("parameters")
+        if not isinstance(parameters,Mapping): parameters={}
+        details=parameters.get("details")
+        if not isinstance(details,Mapping): details={}
+        actions=self.catalog.get("actions")
+        entry=actions.get(request.get("action")) if isinstance(actions,Mapping) else None
+        safe=schema_safe_fields(entry if isinstance(entry,Mapping) else {})
+        def row(label: str, rendered: Any) -> str:
+            if not rendered: return ""
+            return f"<dt>{html.escape(label)}</dt><dd>{html.escape(str(rendered))}</dd>"
+        def screened(label: str, name: str, item: Any, limit: int = 160) -> str:
+            if not isinstance(item,str) or not item: return ""
+            if name in safe:
+                rendered=presentation_safe_text(item,limit=limit)
+                if rendered is not None: return row(label,rendered)
+            return row(label,redaction_fingerprint(item,f"{label.casefold()} is not schema-marked presentation-safe"))
+        def fingerprint(label: str, item: Any) -> str:
+            if not isinstance(item,str) or not item: return ""
+            return row(label,redaction_fingerprint(item,f"{label.casefold()} content"))
+        attachments=details.get("attachments")
+        attachment_names=[]
+        for item in (attachments if isinstance(attachments,(list,tuple)) else ())[:8]:
+            if not isinstance(item,str) or not item: continue
+            rendered=presentation_safe_text(item) if "attachments" in safe else None
+            attachment_names.append(rendered if rendered is not None
+                                    else redaction_fingerprint(item,"attachment name is not schema-marked presentation-safe"))
+        fields="".join(filter(None,(
+            screened("Channel","channel",details.get("channel"),limit=32),
+            screened("Recipient","recipient",details.get("recipient")),
+            screened("Listing ID","listing_id",details.get("listing_id"),limit=64),
+            row("Attachments","; ".join(attachment_names)),
+            # Message content is never schema-authorizable on this surface.
+            fingerprint("Subject",details.get("subject")),
+            fingerprint("Message body",details.get("body")),
+        )))
+        raw_challenge=request.get("approval_challenge")
+        challenge=raw_challenge if isinstance(raw_challenge,Mapping) else {}
+        expiry=challenge.get("expires_at","")
+        binding=(
+            "<p class=muted>Message and parameter content is withheld; only redaction fingerprints are shown. "
+            "The full sanitized semantic record below is the complete review surface.</p>"
+            f"<dl><dt>Request hash</dt><dd><code>{html.escape(str(request.get('request_hash','')))}</code></dd>"
+            f"<dt>Approval expires at</dt><dd>{html.escape(str(expiry))}</dd></dl>"
+            "<p>If this request expires, submit a new proposal; never reuse an old decision.</p>"
+        )
+        return f"<details class=request-review><summary>Review exact request</summary><dl>{fields}</dl>{binding}</details>"
+
+    def _semantic_record(self, item: Mapping[str,Any], observations=None) -> dict:
+        """Build the complete sanitized semantic record for one request snapshot."""
+        request_id=str(item.get("request_id") or "")
+        # Fetch one past each record cap (storage-level LIMIT) so the record can
+        # mark truncation explicitly without ever materializing the full table.
+        audit=self.control.ledger.audit_events(request_id,limit=MAX_AUDIT+1) if request_id else []
+        notices=(self.control.ledger.notifications_for_request(request_id,limit=MAX_NOTICES+1)
+                 if request_id else [])
+        if observations is None:
+            observations=self.control.ledger.recent_observations(limit=200)
+        telemetry=[row for row in observations
+                   if isinstance(row,Mapping) and request_id and row.get("correlation_id")==request_id]
+        node=self.principal_contexts.get(str(item.get("requester") or ""),{}).get("node")
+        return build_semantic_record(item,catalog=self.catalog,node=node,
+                                     audit_events=audit,notifications=notices,telemetry=telemetry)
+
+    def _record_details(self, item: Mapping[str,Any], observations=None) -> str:
+        """Expandable, escaped Full-semantic-record fragment with its stable detail link."""
+        record=self._semantic_record(item,observations)
+        request_id=str(item.get("request_id") or "")
+        href=f"/admin/requests/{request_id}" if _REQUEST_ID.fullmatch(request_id) else None
+        return render_semantic_record_html(record,detail_href=href)
+
+    def _request_detail(self, request_id: str) -> Response:
+        """Stable authenticated detail page keyed by request ID; sanitized record only."""
+        if not _REQUEST_ID.fullmatch(request_id):
+            return _json(404,{"error":"not found"})
+        try:
+            item=self.control.get_request(request_id,principal=self.admin_principal_id,admin=True)
+        except (GateControlError,KeyError,ValueError):
+            return _json(404,{"error":"request not found"})
+        fragment=render_semantic_record_html(self._semantic_record(item),open_by_default=True)
+        safe_id=html.escape(request_id)
+        page=(f"<!doctype html><html lang=en><head><meta charset=utf-8>"
+              f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+              f"<title>Semantic record {safe_id}</title><style>{_PANEL_CSS}</style></head><body><main>"
+              f"<h1>Full semantic record</h1>"
+              f"<p class=muted>Request <code>{safe_id}</code>. This page is a complete sanitized record; "
+              f"decisions stay on the <a href='/'>main panel</a>.</p>{fragment}</main></body></html>")
+        return self._bounded_html(page,self.DETAIL_MAX_BYTES,"record detail")
+
+    def _decision_card(self, item: Mapping[str,Any], *, csrf: str, now: int, observations=None) -> str:
         """Render one pending decision from the bounded, allowlisted projection only."""
         card=build_decision_card(
             item,catalog=self.catalog,now=now,
-            delivery=self.control.ledger.notifications_for_request(str(item.get("request_id",""))),
+            delivery=self.control.ledger.notifications_for_request(str(item.get("request_id","")),
+                                                                   limit=MAX_NOTICES+1),
         )
         dry_run=item.get("auto_approval")
         explanation=""
         if isinstance(dry_run,Mapping) and dry_run.get("matched") is False:
-            explanation=(f"<p class=muted><b>Auto-approval did not apply</b> - {html.escape(str(dry_run.get('reason','')))}</p>")
+            reason=presentation_safe_text(dry_run.get("reason"),limit=300) or "reason withheld"
+            explanation=(f"<p class=muted><b>Auto-approval did not apply</b> - {html.escape(reason)}</p>")
         return (f"<article class='decision {html.escape(card['urgency'])}'>{render_decision_card_html(card)}{explanation}"
-                f"{self._decision_controls(item,csrf=csrf,card=card)}{_request_review(item)}</article>")
+                f"{self._decision_controls(item,csrf=csrf,card=card)}{self._request_review(item)}"
+                f"{self._record_details(item,observations)}</article>")
 
     def _wired_auto_approval(self):
         """The auto-approval policy actually wired into the backend, never a separate copy."""
@@ -381,18 +464,68 @@ class SemanticGateApplication:
         if len(items)>32 or any(len(item)>128 for item in items): raise GateControlError("control list is too large")
         return items
 
-    def _panel(self, session: str, feed: str = "decisions") -> Response:
+    @staticmethod
+    def _page_param(query: Mapping[str,Any], name: str) -> int:
+        raw=(query.get(name) or ["1"])[0]
+        if not re.fullmatch(r"[1-9][0-9]{0,5}",raw): raise GateControlError(f"{name} must be a positive integer")
+        return int(raw)
+
+    @staticmethod
+    def _pager(label: str, param: str, page: int, total: int, size: int, base: str) -> str:
+        """Stable next/previous controls; page numbers are validated positive integers."""
+        pages=max(1,-(-total//size))
+        previous=f" <a href='{base}&{param}={page-1}'>Previous page</a>" if page>1 else ""
+        following=f" <a href='{base}&{param}={page+1}'>Next page</a>" if page<pages else ""
+        return (f"<nav class=feeds aria-label='{html.escape(label)} pages'>"
+                f"<span class=muted>Page {page} of {pages} ({total} total)</span>{previous}{following}</nav>")
+
+    @staticmethod
+    def _bounded_html(document: str, max_bytes: int, surface: str) -> Response:
+        """Fail closed before responding: oversized panel/detail output is withheld."""
+        encoded=document.encode()
+        if len(encoded)>max_bytes:
+            marker=html.escape(f"[redacted: {surface} exceeds {max_bytes} serialized bytes]")
+            fallback=(f"<!doctype html><html lang=en><head><meta charset=utf-8>"
+                      f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+                      f"<title>Semantic Gate</title><style>{_PANEL_CSS}</style></head><body><main>"
+                      f"<h1>Content withheld</h1><p class=warn>{marker}</p>"
+                      f"<p><a href='/'>Return to the main panel</a></p></main></body></html>")
+            return Response(200,{"Content-Type":"text/html;charset=UTF-8","Cache-Control":"no-store"},fallback.encode())
+        return Response(200,{"Content-Type":"text/html;charset=UTF-8","Cache-Control":"no-store"},encoded)
+
+    def _panel(self, session: str, feed: str = "decisions", state: str = "all", *, page: int = 1, pending_page: int = 1) -> Response:
         now=int(self.clock()); csrf=self._csrf(session); controls=self.control.ledger.controls()
-        requests=self.control.list_requests(principal=self.admin_principal_id,admin=True,limit=100)
-        pending=[item for item in requests if item.get("state")=="waiting_for_approval"]
-        completed=[item for item in requests if item.get("state")!="waiting_for_approval"]
+        counts=self.control.ledger.request_state_counts()
+        pending_total=counts.get("waiting_for_approval",0)
+        state_counts={name:counts.get(name,0) for name in self.HISTORY_STATES if name!="all"}
+        state_counts["all"]=sum(count for name,count in counts.items() if name!="waiting_for_approval")
+        pending=self.control.list_requests(principal=self.admin_principal_id,admin=True,state="waiting_for_approval",
+                                           limit=self.PENDING_PAGE_SIZE,offset=(pending_page-1)*self.PENDING_PAGE_SIZE)
+        history_filter={"exclude_state":"waiting_for_approval"} if state=="all" else {"state":state}
+        completed=self.control.list_requests(principal=self.admin_principal_id,admin=True,
+                                             limit=self.HISTORY_PAGE_SIZE,offset=(page-1)*self.HISTORY_PAGE_SIZE,
+                                             **history_filter)
+        completed_total=state_counts[state]
+        observations=self.control.ledger.recent_observations(limit=200)
+        base=f"/?feed={feed}&state={state}"
+        pending_pager=(self._pager("Pending decisions","pending_page",pending_page,pending_total,
+                                   self.PENDING_PAGE_SIZE,f"{base}&page={page}")
+                       if pending_total>self.PENDING_PAGE_SIZE or pending_page>1 else "")
+        history_pager=self._pager("Completed history","page",page,completed_total,
+                                  self.HISTORY_PAGE_SIZE,f"{base}&pending_page={pending_page}")
+        state_nav="".join(
+            (f"<b class=chip>{name} ({state_counts[name]})</b>" if name==state
+             else f"<a href='/?state={name}'>{name} ({state_counts[name]})</a>")
+            for name in self.HISTORY_STATES)
         status=self.status_provider()
         relay=status.get("relay",{}) if isinstance(status,Mapping) else {}
         outbox=status.get("notification_outbox",{}) if isinstance(status,Mapping) else {}
+        relay_error=relay.get("last_error")
+        relay_error=redaction_fingerprint(relay_error,"provider error content") if isinstance(relay_error,str) and relay_error else "none"
         delivery_banner=(f"<p><b>Provider status: {html.escape(str(relay.get('status','not configured')))}</b> · "
                          f"{int(outbox.get('pending',0))} pending · {int(outbox.get('unknown',0))} unknown</p>"
                          f"<p class=muted>Last success: {html.escape(_utc(relay.get('last_success_at')))} · "
-                         f"Last error: {html.escape(str(relay.get('last_error') or 'none'))}</p>")
+                         f"Last error: {html.escape(relay_error)}</p>")
         execution_enabled=self._wired_execution_enabled()
         headline=("Execution is enabled by the loaded policy; simulation-only gates still simulate."
                   if execution_enabled else "Execution is globally disabled; decisions simulate only.")
@@ -400,17 +533,18 @@ class SemanticGateApplication:
                           "Human approval and a host execution authority are still required for any live effect.</p>"
                           if execution_enabled else
                           "<p class=banner>Execution is globally disabled: <b>execution_enabled=false</b>, simulation only.</p>")
-        cards="".join(self._decision_card(item,csrf=csrf,now=now) for item in pending) or "<p class=muted>No decision is waiting.</p>"
+        cards="".join(self._decision_card(item,csrf=csrf,now=now,observations=observations) for item in pending) or "<p class=muted>No decision is waiting.</p>"
         history="".join(
             f"<tr><td><code>{html.escape(str(item.get('request_id','')))}</code></td><td>{html.escape(str(item.get('action','')))}</td>"
             f"<td>{html.escape(str(item.get('requester','')))}</td><td>{html.escape(str(item.get('effective_control','policy')))}</td>"
-            f"<td>{html.escape(str(item.get('state','')))}</td><td>{html.escape(_utc(item.get('updated_at') or item.get('created_at')))}</td></tr>"
-            for item in completed) or "<tr><td colspan=6>No completed decisions yet.</td></tr>"
+            f"<td>{html.escape(str(item.get('state','')))}</td><td>{html.escape(_utc(item.get('updated_at') or item.get('created_at')))}</td>"
+            f"<td>{self._record_details(item,observations)}</td></tr>"
+            for item in completed) or "<tr><td colspan=7>No completed decisions yet.</td></tr>"
         action_rows="".join(f"<tr><td><code>{html.escape(action)}</code></td><td>{html.escape(str(value.get('risk','')))}</td><td>{html.escape(str(value.get('effect','')))}</td><td>{html.escape(str(value.get('summary','')))}</td></tr>" for action,value in sorted(self.catalog.get("actions",{}).items()))
         cred_rows="".join(f"<tr><td>{html.escape(item['credential_id'])}</td><td>{html.escape(item['adapter'])}</td><td>{html.escape(item['status'])}</td></tr>" for item in self.credentials.public_inventory())
         audit_events=self.control.ledger.audit_events(limit=200)
         audit_rows="".join(f"<tr><td>{event['seq']}</td><td>{html.escape(str(event['event']))}</td><td>{html.escape(str(event['actor']))}</td><td><code>{html.escape(str(event.get('request_id') or ''))}</code></td><td>{html.escape(_utc(event['at']))}</td></tr>" for event in audit_events)
-        page=(f"<!doctype html><html lang=en><head><meta charset=utf-8>"
+        document=(f"<!doctype html><html lang=en><head><meta charset=utf-8>"
               f"<meta name=viewport content='width=device-width,initial-scale=1'>"
               f"<meta http-equiv=refresh content=20>"
               f"<title>Semantic Gate decisions</title><style>{_PANEL_CSS}</style></head><body>"
@@ -419,13 +553,16 @@ class SemanticGateApplication:
               f"<section aria-labelledby=delivery-heading><h2 id=delivery-heading>Coordinator health</h2>"
               f"{execution_banner}"
               f"{delivery_banner}</section>"
-              f"<section id=pending aria-labelledby=pending-heading><h2 id=pending-heading>Pending decisions ({len(pending)})</h2>{cards}</section>"
-              f"{self._feed_section(feed,audit_events=audit_events,observations=self.control.ledger.recent_observations(limit=200))}"
+              f"<section id=pending aria-labelledby=pending-heading><h2 id=pending-heading>Pending decisions ({pending_total})</h2>{pending_pager}{cards}</section>"
+              f"{self._feed_section(feed,audit_events=audit_events,observations=observations)}"
               f"{self._auto_approval_section(csrf,now=now,controls=controls)}"
               f"<section aria-labelledby=history-heading><h2 id=history-heading>Completed history</h2>"
+              f"<nav class=feeds aria-label='History state filters'>{state_nav}</nav>"
+              f"{history_pager}"
               f"<table><caption class=muted>Decided requests are terminal and are never revived.</caption><thead><tr>"
               f"<th scope=col>Request</th><th scope=col>Action</th><th scope=col>Requester</th>"
-              f"<th scope=col>Effective control</th><th scope=col>State</th><th scope=col>Updated</th></tr></thead>"
+              f"<th scope=col>Effective control</th><th scope=col>State</th><th scope=col>Updated</th>"
+              f"<th scope=col>Full record</th></tr></thead>"
               f"<tbody>{history}</tbody></table></section>"
               f"<section aria-labelledby=controls-heading><h2 id=controls-heading>Emergency controls</h2>{self._control_forms(csrf)}</section>"
               f"<section aria-labelledby=reference-heading><h2 id=reference-heading>Reference</h2>"
@@ -436,7 +573,7 @@ class SemanticGateApplication:
               f"<details><summary>Full audit ledger</summary><table><caption class=muted>Audit rows are append-only.</caption><thead><tr><th scope=col>#</th><th scope=col>Event</th>"
               f"<th scope=col>Actor</th><th scope=col>Request</th><th scope=col>Time</th></tr></thead>"
               f"<tbody>{audit_rows}</tbody></table></details></section></main></body></html>")
-        return Response(200,{"Content-Type":"text/html;charset=UTF-8","Cache-Control":"no-store"},page.encode())
+        return self._bounded_html(document,self.PANEL_MAX_BYTES,"panel")
 
     @staticmethod
     def _login_page() -> Response:
@@ -504,10 +641,16 @@ class SemanticGateApplication:
             if route=="/" and method=="GET":
                 try: _,session=self._admin(headers)
                 except AuthError: return Response(303,{"Location":"/login","Cache-Control":"no-store"},b"")
-                query=parse_qs(urlsplit(path).query,keep_blank_values=False,max_num_fields=4)
+                query=parse_qs(urlsplit(path).query,keep_blank_values=False,max_num_fields=8)
+                unknown=set(query)-self.PANEL_QUERY_PARAMS
+                if unknown: raise GateControlError(f"unknown query parameter(s): {sorted(unknown)}")
+                if any(len(values)!=1 for values in query.values()): raise GateControlError("duplicate query parameter")
                 selected=(query.get("feed") or ["decisions"])[0]
                 if selected not in self.FEEDS: raise GateControlError("unknown activity feed")
-                return self._panel(session,selected)
+                state=(query.get("state") or ["all"])[0]
+                if state not in self.HISTORY_STATES: raise GateControlError("unknown history state filter")
+                page=self._page_param(query,"page"); pending_page=self._page_param(query,"pending_page")
+                return self._panel(session,selected,state,page=page,pending_page=pending_page)
             if route=="/mcp" and method=="POST": return self._mcp(self._action_bearer(headers),self._decode(body))
             if route=="/api/v1/actions" and method=="GET":
                 p=self._action_bearer(headers); return _json(200,self.control.list_actions(p.principal_id))
@@ -524,6 +667,12 @@ class SemanticGateApplication:
                 if len(parts)==5 and parts[4]=="cancel" and method=="POST":
                     return _json(200,self.control.cancel(parts[3],principal=p.principal_id))
                 return _json(404,{"error":"not found"})
+            if route.startswith("/admin/requests/") and method=="GET":
+                parts=route.strip("/").split("/")
+                if len(parts)!=3: return _json(404,{"error":"not found"})
+                try: self._admin(headers)
+                except AuthError: return Response(303,{"Location":"/login","Cache-Control":"no-store"},b"")
+                return self._request_detail(parts[2])
             if route.startswith("/admin/requests/") and method=="POST":
                 is_form=(_header(headers,"Content-Type") or "").split(";",1)[0].strip().casefold()=="application/x-www-form-urlencoded"
                 submitted=self._form(body) if is_form else self._decode(body)

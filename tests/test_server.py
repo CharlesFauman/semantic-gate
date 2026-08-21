@@ -45,7 +45,7 @@ class SemanticGateApplicationTests(unittest.TestCase):
         principals={"agent":{"role":"agent","enabled":True},"observer":{"role":"observer","enabled":True},"control":{"role":"admin","enabled":True}}
         self.authority=CapabilityAuthority(bytes.fromhex("33"*32),principals)
         credentials=root/"credentials.json"; credentials.write_text(json.dumps({"credentials":{"device":{"adapter":"example","kind":"token","value":"never-render-me"}}}))
-        self.app=SemanticGateApplication(self.control,self.authority,CredentialRegistry(credentials),catalog={"actions":{"device.power_off":{"risk":"R2","effect":"write","summary":"Power off an allowlisted display","presentation":{"proposed_effect":"Power off the allowlisted meeting-room display","reason":"Display is idle outside booked hours","node":"node-example-1","safe_target_field":"target","safe_target_values":["example-display"],"spends":False,"communicates":False,"changes_state":True}}}},admin_password="correct horse battery staple",origins=["https://control.example","http://127.0.0.1:18790"],clock=lambda:100)
+        self.app=SemanticGateApplication(self.control,self.authority,CredentialRegistry(credentials),catalog={"actions":{"device.power_off":{"risk":"R2","effect":"write","summary":"Power off an allowlisted display","presentation":{"proposed_effect":"Power off the allowlisted meeting-room display","reason":"Display is idle outside booked hours","node":"node-example-1","safe_target_field":"target","safe_target_values":["example-display"],"spends":False,"communicates":False,"changes_state":True}},"communication.send":{"risk":"R3","effect":"external_write","summary":"Send a message to a person","gate_class":"human_communication","presentation_safe_parameters":["channel","recipient","listing_id","attachments"]}}},admin_password="correct horse battery staple",origins=["https://control.example","http://127.0.0.1:18790"],clock=lambda:100)
         self.agent={"Authorization":f"Bearer {self.authority.token_for('agent')}"}
         self.observer={"Authorization":f"Bearer {self.authority.token_for('observer')}"}
     def tearDown(self): self.ledger.close(); self.tmp.cleanup()
@@ -228,15 +228,17 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.call("POST","/api/v1/requests",self.agent,{"action":"communication.send","parameters":parameters,"context":{},"idempotency_key":"communication-review"})
         text=self.call("GET","/",{"Cookie":cookie}).body.decode()
         self.assertIn("Review exact request",text)
+        # Safe semantic recipient/attachment metadata remains reviewable.
         self.assertIn("support@example.test",text)
-        self.assertIn("Exact component confirmation",text)
-        self.assertIn("Hello supplier,",text)
-        self.assertIn("Please confirm &lt;exact&gt; parts &amp; warranty.",text)
-        self.assertNotIn("Please confirm <exact> parts & warranty.",text)
+        self.assertIn("email",text)
         self.assertIn("LIST-123",text)
         self.assertIn("requirements.pdf",text)
-        self.assertIn("Canonical normalized parameters",text)
-        self.assertIn('&quot;details&quot;',text)
+        # Message content never renders raw anywhere in the panel; fingerprints replace it.
+        for leaked in ("Exact component confirmation","Hello supplier,","Please confirm",
+                       "Canonical normalized parameters",'&quot;details&quot;'):
+            with self.subTest(leaked=leaked): self.assertNotIn(leaked,text)
+        self.assertIn("[redacted: message body content",text)
+        self.assertIn("[redacted: subject content",text)
         self.assertIn("Request hash",text)
         self.assertIn("h"*64,text)
         self.assertIn("Approval expires at",text)
@@ -297,8 +299,10 @@ class SemanticGateApplicationTests(unittest.TestCase):
             with self.subTest(expected=expected): self.assertIn(expected,card)
         for leaked in ("Hello supplier","Please confirm parts","LIST-123","requirements.pdf","Exact component confirmation","Email supplier before purchase","Canonical normalized parameters"):
             with self.subTest(leaked=leaked): self.assertNotIn(leaked,card)
-        self.assertIn("Hello supplier,",text)
-        self.assertIn("Canonical normalized parameters",text)
+        # Message bodies never render raw anywhere; the review shows an explicit fingerprint instead.
+        self.assertNotIn("Hello supplier,",text)
+        self.assertNotIn("Canonical normalized parameters",text)
+        self.assertIn("[redacted: message body content",text)
 
     def test_panel_is_responsive_and_keyboard_accessible(self):
         login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
@@ -435,6 +439,120 @@ class SemanticGateApplicationTests(unittest.TestCase):
         self.assertIn("policy gate",denials)
         self.assertNotIn("tool exited",denials)
         self.assertEqual(400,self.call("GET","/?feed=../etc",{"Cookie":cookie}).status)
+
+    def login_pair(self):
+        login=self.call("POST","/login",payload={"username":"control","password":"correct horse battery staple"})
+        cookie=login.headers["Set-Cookie"].split(";",1)[0]
+        return {"Cookie":cookie},{"Cookie":cookie,"Origin":"https://control.example","X-CSRF-Token":login.headers["X-CSRF-Token"]}
+
+    def test_history_pagination_is_stable_and_counts_are_accurate(self):
+        session,admin=self.login_pair()
+        self.app.HISTORY_PAGE_SIZE=2
+        for index in range(5):
+            request=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":f"page{index}"}).json()
+            self.call("POST",f"/admin/requests/{request['request_id']}/deny",admin,request["approval_challenge"])
+        first=self.call("GET","/",session).body.decode()
+        self.assertIn("Page 1 of 3 (5 total)",first)
+        self.assertIn("denied (5)",first)
+        self.assertIn("all (5)",first)
+        self.assertIn("&page=2",first)
+        self.assertNotIn("Previous page",first[first.index("Completed history"):])
+        history=first[first.index("Completed history"):first.index("Emergency controls")]
+        self.assertEqual(2,len(set(re.findall(r"req_page[0-9]",history))))
+        last=self.call("GET","/?page=3",session).body.decode()
+        self.assertIn("Page 3 of 3 (5 total)",last)
+        self.assertIn("Previous page",last)
+        self.assertNotIn("Next page",last[last.index("Completed history"):])
+        last_history=last[last.index("Completed history"):last.index("Emergency controls")]
+        self.assertEqual(1,len(set(re.findall(r"req_page[0-9]",last_history))))
+        seen=set()
+        for page in (1,2,3):
+            body=self.call("GET",f"/?page={page}",session).body.decode()
+            chunk=body[body.index("Completed history"):body.index("Emergency controls")]
+            seen.update(re.findall(r"req_page[0-9]",chunk))
+        self.assertEqual({f"req_page{index}" for index in range(5)},seen)
+        filtered=self.call("GET","/?state=denied&page=2",session).body.decode()
+        self.assertIn("Page 2 of 3 (5 total)",filtered)
+
+    def test_pending_decisions_paginate_with_accurate_totals(self):
+        session,_=self.login_pair()
+        self.app.PENDING_PAGE_SIZE=1
+        for index in range(3):
+            self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":f"wait{index}"})
+        panel=self.call("GET","/",session).body.decode()
+        self.assertIn("Pending decisions (3)",panel)
+        self.assertIn("pending_page=2",panel)
+        pending=panel[panel.index("Pending decisions (3)"):panel.index("Activity feeds")]
+        self.assertEqual(1,len(set(re.findall(r"req_wait[0-9]",pending))))
+        second=self.call("GET","/?pending_page=2",session).body.decode()
+        self.assertIn("Pending decisions (3)",second)
+        self.assertIn("pending_page=1",second)
+        self.assertIn("pending_page=3",second)
+        second_pending=second[second.index("Pending decisions (3)"):second.index("Activity feeds")]
+        self.assertEqual(1,len(set(re.findall(r"req_wait[0-9]",second_pending))))
+
+    def test_panel_query_params_are_strictly_validated(self):
+        session,_=self.login_pair()
+        for path in ("/?page=0","/?page=abc","/?page=-1","/?pending_page=1e3","/?page=1&page=2",
+                     "/?bogus=1","/?page=9999999"):
+            with self.subTest(path=path):
+                self.assertEqual(400,self.call("GET",path,session).status)
+        self.assertEqual(200,self.call("GET","/?feed=telemetry&state=denied&page=1&pending_page=1",session).status)
+        empty=self.call("GET","/?page=7",session)
+        self.assertEqual(200,empty.status)
+        self.assertIn("No completed decisions yet",empty.body.decode())
+
+    def test_panel_and_detail_fail_closed_when_serialized_bytes_exceed_the_bound(self):
+        session,_=self.login_pair()
+        request=self.call("POST","/api/v1/requests",self.agent,{"action":"device.power_off","parameters":{},"context":{},"idempotency_key":"bounded"}).json()
+        self.app.PANEL_MAX_BYTES=600
+        panel=self.call("GET","/",session)
+        self.assertEqual(200,panel.status)
+        text=panel.body.decode()
+        self.assertIn("[redacted: panel exceeds 600 serialized bytes]",text)
+        self.assertIn("Content withheld",text)
+        self.assertNotIn(request["request_id"],text)
+        self.app.DETAIL_MAX_BYTES=600
+        detail=self.call("GET",f"/admin/requests/{request['request_id']}",session).body.decode()
+        self.assertIn("[redacted: record detail exceeds 600 serialized bytes]",detail)
+        self.assertNotIn("approval_challenge",detail)
+
+    def test_request_review_withholds_metadata_without_schema_authorization(self):
+        # marketplace.contact is not in this app's catalogue, so no field is
+        # schema-marked presentation-safe: recipients and attachment names must
+        # appear only as redaction fingerprints, never as text.
+        session,_=self.login_pair()
+        parameters={"summary":"x","target":"y","details":{
+            "channel":"chat-transport-x","recipient":"hunter2 <script>alert(1)</script>",
+            "subject":"token ghp_AAAAbbbb1111CCCC2222dddd3333EEEE44",
+            "body":"Authorization: Bearer super-secret-value",
+            "attachments":["private recovery phrase.txt","evil<script>.pdf"]}}
+        self.call("POST","/api/v1/requests",self.agent,{"action":"marketplace.contact","parameters":parameters,"context":{},"idempotency_key":"advreview"})
+        text=self.call("GET","/",session).body.decode()
+        for leaked in ("<script","Bearer super-secret-value","ghp_AAAA","alert(1)</script>",
+                       "hunter2","private recovery phrase","chat-transport-x"):
+            with self.subTest(leaked=leaked): self.assertNotIn(leaked,text)
+        self.assertIn("recipient is not schema-marked presentation-safe",text)
+        self.assertIn("attachment name is not schema-marked presentation-safe",text)
+        # A secret-looking body/subject collapses to the secret-material marker (no hash).
+        self.assertIn("[redacted: value matches secret material patterns]",text)
+
+    def test_request_review_renders_schema_authorized_safe_metadata(self):
+        # communication.send declares presentation_safe_parameters, so those exact
+        # fields render as screened text; message content still only fingerprints.
+        session,_=self.login_pair()
+        parameters={"summary":"x","target":"y","details":{
+            "channel":"chat","recipient":"facilities@example.test","listing_id":"listing-1234",
+            "attachments":["ok.pdf","evil<script>.pdf"],"subject":"a plain subject line"}}
+        self.call("POST","/api/v1/requests",self.agent,{"action":"communication.send","parameters":parameters,"context":{},"idempotency_key":"safereview"})
+        text=self.call("GET","/",session).body.decode()
+        self.assertIn("facilities@example.test",text)
+        self.assertIn("listing-1234",text)
+        self.assertIn("ok.pdf",text)
+        self.assertNotIn("<script",text)
+        # Message content is never schema-authorizable on the review surface.
+        self.assertNotIn("a plain subject line",text)
+        self.assertIn("subject content",text)
 
     def test_http_json_rejects_non_finite_values(self):
         response=self.app.handle("POST","/api/v1/requests",self.agent,b'{"action":"device.power_off","parameters":{"x":NaN},"context":{},"idempotency_key":"nan"}')

@@ -66,6 +66,38 @@ access to the downstream effectful tools that Semantic Gate is meant to gate.
 23. Decision-card projection is closed and bounded. Only action-schema-owned
     presentation fields are projected, sanitized to a printable allowlist,
     length-bounded and escaped. A changed commit voids auto-approval evidence.
+24. The full semantic record is sanitized and fail-closed. The authenticated
+    panel and the admin-session-only detail route
+    (`GET /admin/requests/<request_id>`) render a complete per-request record
+    for pending and historical requests as canonical JSON with no JavaScript.
+    Raw credential/secret/token/password/key/cookie/auth values, schema-marked
+    sensitive parameters, stored credentials, session cookies, authorization
+    headers, prompts, message bodies, command fields, notification claim
+    tokens and binary content are never rendered. Projection is fail-closed
+    by allowlist: values pass a closed section-specific vocabulary (slugs,
+    hashes, enums, epochs, booleans) or a schema-marked presentation-safe
+    field list; every other request/gate/result/postcondition/error/audit
+    string - including CamelCase and synonym spellings and arbitrary field
+    names - becomes explicit `[redacted: reason; sha256=...; chars=N]`
+    fingerprint metadata, values matching credential patterns or high-entropy
+    shapes are redacted without a hash, and mapping keys are sanitized with
+    the same policy. Closed slug positions also fail closed on high-entropy
+    values; only explicit host digest shapes (`req_<hex>`, `notice_<hex>`,
+    commit hashes) and known enum values are exempt. Gate, audit, telemetry
+    and notice inputs are capped before any traversal - at most one item past
+    each cap is ever consumed, marking truncation explicitly, and notification
+    reads are LIMIT-bounded at the storage layer; per-section and total
+    serialized byte bounds are enforced before every panel and detail
+    response and fail closed with explicit markers; adversarial keys/values
+    are HTML escaped. The panel review fragment renders a metadata field as
+    text only when the checked-in catalogue schema explicitly marks that
+    field presentation-safe; every other value - recipients and attachment
+    names included - appears only as a content fingerprint, and message
+    bodies and canonical raw parameters are never rendered. Pagination query parameters
+    are strictly validated and counts come from the ledger, not a truncated
+    page. Internal trusted context is never projected - only its hash
+    appears. The detail route requires the same admin session as the panel;
+    API request reads remain bound to the requesting principal.
 
 ## Host responsibilities
 

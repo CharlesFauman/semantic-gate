@@ -116,6 +116,35 @@ through the gateway directly.
   schema-owned presentation fields, deterministically sanitized, length-bounded
   and escaped. Parameters, prompts, commands, paths, message bodies and
   credentials are never projected.
+- **Full semantic record:** the authenticated panel exposes a complete
+  sanitized record for every request, pending and historical - catalogue
+  action/summary/domain/effect/risk/gate class/privacy classes/constraints,
+  bounded request summary/target/details, requester and host-owned node,
+  minimum/policy/effective control, the matched auto-approval rule ID/version
+  and match or non-match reason, request ID/hash/idempotency key and the
+  trusted-context hash, every gate status with safe evidence, notification
+  delivery, created/updated/expiry/decision timestamps, decision actor and
+  assurance, terminal state with `execution_possible`/`authorizes_execution`
+  and result metadata, plus per-request audit and correlated telemetry. Each
+  request has an expandable record in the panel and a stable authenticated
+  detail route `GET /admin/requests/<request_id>` rendering canonical
+  sanitized JSON without JavaScript. Projection is fail-closed by allowlist:
+  every rendered value passes a closed section-specific vocabulary (slugs,
+  hashes, enums, epochs, booleans) or is schema-marked presentation-safe;
+  any other request/gate/result/postcondition/error/audit string - including
+  CamelCase and synonym spellings and never-seen field names - becomes an
+  explicit `[redacted: reason; sha256=...; chars=N]` fingerprint, and values
+  matching credential patterns or high-entropy shapes are redacted without a
+  hash. Closed slug positions also fail closed on high-entropy values, with
+  only explicit host digest shapes and known enum values exempt. Mapping keys
+  are sanitized with the same policy. Gate, audit, telemetry and notice
+  inputs are capped before any traversal (at most one item past each cap is
+  consumed, marking truncation explicitly, with storage-level LIMIT on
+  notification reads); per-section and total serialized byte bounds fail closed
+  with explicit markers; adversarial keys and values are HTML escaped;
+  internal trusted context appears only as its hash. The panel paginates
+  pending decisions and completed history with strict validated query
+  parameters and database-accurate counts.
 - **Separated failure feeds:** gate decisions, policy denials, gate errors,
   withdrawals and ordinary tool telemetry are distinct. A nonzero exit, timeout,
   interrupt or cancellation is never presented as a Semantic Gate decision.
@@ -188,7 +217,9 @@ See [`examples/`](examples/) for calendar, purchase and device-control flows.
 - authenticated, idempotent audit-only permission observations;
 - proposal-only MCP over HTTP;
 - a keyboard-accessible, JavaScript-free control panel that leads with pending
-  decisions and separates decision, denial and telemetry feeds;
+  decisions, separates decision, denial and telemetry feeds, filters completed
+  history by terminal state and expands a full sanitized semantic record per
+  request with a stable per-request detail route;
 - SQLite request snapshots, audit events, emergency controls and a durable
   notification-outbox foundation;
 - host-derived principal capabilities;

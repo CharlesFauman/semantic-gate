@@ -181,10 +181,13 @@ class GateControl:
         live = self.backend.get_request(request_id, requester=None if admin else principal)
         live["updated_at"] = request.get("updated_at", request["created_at"])
         live.pop("trusted_context", None)
-        return live
+        if "auto_approval" not in live and isinstance(request.get("auto_approval"), Mapping):
+            live["auto_approval"] = dict(request["auto_approval"])
+        return self._attach_approval_challenge(live)
 
-    def list_requests(self, *, principal: str, admin: bool = False, limit: int = 100):
-        requests = self.ledger.list_requests(limit=limit)
+    def list_requests(self, *, principal: str, admin: bool = False, limit: int = 100,
+                      offset: int = 0, state: str | None = None, exclude_state: str | None = None):
+        requests = self.ledger.list_requests(limit=limit, offset=offset, state=state, exclude_state=exclude_state)
         return requests if admin else [item for item in requests if item["requester"] == principal]
 
     def cancel(self, request_id: str, *, principal: str):
